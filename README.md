@@ -45,6 +45,9 @@ Add to `~/.claude/settings.json`:
 | `list` | List notes, optionally filtered by folder. Sorted by creation date. |
 | `update` | Replace note body, preserve frontmatter, bump `updated` date. |
 | `delete` | Delete a note by path. |
+| `create_folder` | Create a folder (and any parent folders). |
+| `delete_folder` | Delete a folder. Use `force: true` for non-empty folders. |
+| `list_folders` | List subfolders, optionally under a parent path. |
 
 ## Frontmatter
 
