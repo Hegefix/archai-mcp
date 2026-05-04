@@ -3,7 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod/v3";
 import matter from "gray-matter";
 import { glob } from "glob";
-import { readFile, writeFile, unlink, mkdir } from "node:fs/promises";
+import { readFile, writeFile, unlink, mkdir, rm, readdir, stat } from "node:fs/promises";
 import { join, dirname } from "node:path";
 
 function getVaultPath(): string {
@@ -415,6 +415,165 @@ server.registerTool(
     return {
       content: [
         { type: "text" as const, text: `Deleted: ${notePath}` },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "create_folder",
+  {
+    description:
+      "Create a folder (and any parent folders) in the Obsidian vault.",
+    inputSchema: {
+      path: z
+        .string()
+        .describe(
+          'Folder path relative to vault root, e.g. "public/tech/react"'
+        ),
+    },
+  },
+  async ({ path: folderPath }) => {
+    const fullPath = resolveVaultPath(folderPath);
+    await mkdir(fullPath, { recursive: true });
+    return {
+      content: [
+        { type: "text" as const, text: `Created folder: ${folderPath}` },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "delete_folder",
+  {
+    description:
+      "Delete a folder and all its contents from the Obsidian vault. Use force=true to delete non-empty folders.",
+    inputSchema: {
+      path: z
+        .string()
+        .describe("Folder path relative to vault root to delete"),
+      force: z
+        .boolean()
+        .optional()
+        .describe(
+          "Delete even if folder is not empty. Defaults to false — will error on non-empty folders."
+        ),
+    },
+    annotations: { destructiveHint: true },
+  },
+  async ({ path: folderPath, force }) => {
+    const fullPath = resolveVaultPath(folderPath);
+
+    let stats;
+    try {
+      stats = await stat(fullPath);
+    } catch {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Error: folder not found at ${folderPath}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    if (!stats.isDirectory()) {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Error: ${folderPath} is not a folder`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    if (!force) {
+      const entries = await readdir(fullPath);
+      if (entries.length > 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Folder ${folderPath} is not empty (${entries.length} items). Call again with force=true to delete anyway.`,
+            },
+          ],
+        };
+      }
+    }
+
+    await rm(fullPath, { recursive: true });
+    return {
+      content: [
+        { type: "text" as const, text: `Deleted folder: ${folderPath}` },
+      ],
+    };
+  }
+);
+
+server.registerTool(
+  "list_folders",
+  {
+    description:
+      "List all folders in the Obsidian vault, optionally under a specific parent folder. Excludes .obsidian.",
+    inputSchema: {
+      path: z
+        .string()
+        .optional()
+        .describe(
+          'Parent folder to list under, e.g. "public". Omit for vault root.'
+        ),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  async ({ path: parentPath }) => {
+    const basePath = parentPath
+      ? resolveVaultPath(parentPath)
+      : VAULT_PATH;
+
+    let entries: string[];
+    try {
+      entries = await readdir(basePath);
+    } catch {
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Error: folder not found at ${parentPath ?? "/"}`,
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const folders: string[] = [];
+    for (const entry of entries) {
+      if (entry === ".obsidian") continue;
+      const entryPath = join(basePath, entry);
+      const stats = await stat(entryPath);
+      if (stats.isDirectory()) {
+        folders.push(parentPath ? join(parentPath, entry) : entry);
+      }
+    }
+
+    if (folders.length === 0) {
+      return {
+        content: [
+          { type: "text" as const, text: "No subfolders found." },
+        ],
+      };
+    }
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: folders.map((f) => `- ${f}`).join("\n"),
+        },
       ],
     };
   }

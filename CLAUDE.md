@@ -31,4 +31,4 @@ Set `ARCHAI_PATH` in the inspector's environment configuration.
 - Filesystem-backed — all operations read/write markdown files directly in the vault
 - `gray-matter` for frontmatter parsing/serialization
 - `glob` for file discovery
-- Six tools: `save`, `read`, `search`, `list`, `update`, `delete`
+- Nine tools: `save`, `read`, `search`, `list`, `update`, `delete`, `create_folder`, `delete_folder`, `list_folders`
