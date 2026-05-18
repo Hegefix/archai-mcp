@@ -1,12 +1,44 @@
-import { join } from "node:path";
+import * as path from "node:path";
 import { glob } from "glob";
 
+export function normalizeVaultPath(input: string): string {
+  if (typeof input !== "string") {
+    throw new Error("Path must be a string");
+  }
+  if (input.trim() === "") {
+    throw new Error("Path is empty");
+  }
+  const forward = input.replace(/\\/g, "/");
+  if (path.posix.isAbsolute(forward) || path.win32.isAbsolute(forward)) {
+    throw new Error(`Path must be relative to vault root, got absolute: ${input}`);
+  }
+  const normalized = path.posix.normalize(forward);
+  if (normalized === ".." || normalized.startsWith("../")) {
+    throw new Error(`Path traversal detected: ${input}`);
+  }
+  if (normalized !== "." && normalized.endsWith("/")) {
+    return normalized.slice(0, -1);
+  }
+  return normalized;
+}
+
 export function resolveVaultPath(vaultPath: string, relativePath: string): string {
-  const resolved = join(vaultPath, relativePath);
+  const normalized = normalizeVaultPath(relativePath);
+  const resolved = path.join(vaultPath, normalized);
   if (!resolved.startsWith(vaultPath)) {
     throw new Error("Path traversal detected");
   }
   return resolved;
+}
+
+export function relativeFromTo(fromFile: string, toFile: string): string {
+  const fromDir = path.posix.dirname(normalizeVaultPath(fromFile));
+  const toNorm = normalizeVaultPath(toFile);
+  return path.posix.relative(fromDir, toNorm);
+}
+
+export function vaultBasename(rel: string): string {
+  return path.posix.basename(normalizeVaultPath(rel), ".md");
 }
 
 export function getAllMarkdownFiles(vaultPath: string): Promise<string[]> {
@@ -14,5 +46,6 @@ export function getAllMarkdownFiles(vaultPath: string): Promise<string[]> {
     cwd: vaultPath,
     ignore: [".obsidian/**"],
     nodir: true,
+    posix: true,
   });
 }
