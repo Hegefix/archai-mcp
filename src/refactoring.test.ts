@@ -734,3 +734,127 @@ describe("bulk_move", () => {
     expect(a).toBe("[[renamed]]");
   });
 });
+
+describe("rewrite_links", () => {
+  let vault: string;
+  let client: Client;
+  let close: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ vault, client, close } = await setupVault());
+  });
+
+  afterEach(async () => {
+    await close();
+  });
+
+  it("rewrites wikilinks across multiple files preserving aliases and headings", async () => {
+    await writeNote(vault, "a.md", "see [[old]] and [[old|alt]] and [[old#H]]");
+    await writeNote(vault, "b.md", "and embed ![[old]]");
+
+    const r = await callTool(client, "rewrite_links", {
+      from: "old",
+      to: "new",
+    });
+    const sc = r.structuredContent as { updates: unknown[] };
+    expect(sc.updates).toHaveLength(4);
+
+    const a = await readFile(join(vault, "a.md"), "utf-8");
+    expect(a).toBe("see [[new]] and [[new|alt]] and [[new#H]]");
+    const b = await readFile(join(vault, "b.md"), "utf-8");
+    expect(b).toBe("and embed ![[new]]");
+  });
+
+  it("rewrites markdown-style links whose basename matches", async () => {
+    await writeNote(vault, "a.md", "click [x](./old.md) or [y](sub/old.md)");
+    const r = await callTool(client, "rewrite_links", {
+      from: "old",
+      to: "new",
+    });
+    expect((r.structuredContent as { updates: unknown[] }).updates).toHaveLength(2);
+    const a = await readFile(join(vault, "a.md"), "utf-8");
+    expect(a).toBe("click [x](new.md) or [y](sub/new.md)");
+  });
+
+  it("dry_run does not write", async () => {
+    await writeNote(vault, "a.md", "see [[old]]");
+    const r = await callTool(client, "rewrite_links", {
+      from: "old",
+      to: "new",
+      dry_run: true,
+    });
+    const sc = r.structuredContent as { updates: unknown[]; dry_run: boolean };
+    expect(sc.dry_run).toBe(true);
+    expect(sc.updates).toHaveLength(1);
+    const a = await readFile(join(vault, "a.md"), "utf-8");
+    expect(a).toBe("see [[old]]");
+  });
+
+  it("leaves wikilinks inside code blocks alone", async () => {
+    await writeNote(vault, "a.md", "real [[old]] code `[[old]]`");
+    await callTool(client, "rewrite_links", { from: "old", to: "new" });
+    const a = await readFile(join(vault, "a.md"), "utf-8");
+    expect(a).toBe("real [[new]] code `[[old]]`");
+  });
+});
+
+describe("git_push", () => {
+  let vault: string;
+  let client: Client;
+  let close: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ vault, client, close } = await setupVault());
+  });
+
+  afterEach(async () => {
+    await close();
+  });
+
+  it("errors when vault is not a git repo", async () => {
+    const r = await callTool(client, "git_push");
+    expect(r.isError).toBe(true);
+  });
+
+  it("returns pushed=false with verbatim error when no remote configured", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "a.md", "");
+    const sg = simpleGit(vault);
+    await sg.add(["-A"]);
+    await sg.commit("init");
+
+    const r = await callTool(client, "git_push");
+    expect(r.isError).toBe(true);
+    const sc = r.structuredContent as {
+      pushed: boolean;
+      error?: string;
+      remote: string;
+    };
+    expect(sc.pushed).toBe(false);
+    expect(sc.remote).toBe("origin");
+    expect(sc.error).toBeDefined();
+  });
+
+  it("pushes to a local bare remote", async () => {
+    const remotePath = await mkdtemp(join(tmpdir(), "archai-bare-"));
+    try {
+      await simpleGit(remotePath).init(true);
+      await initGitInVault(vault);
+      await writeNote(vault, "a.md", "");
+      const sg = simpleGit(vault);
+      await sg.add(["-A"]);
+      await sg.commit("init");
+      await sg.addRemote("origin", remotePath);
+
+      const r = await callTool(client, "git_push");
+      const sc = r.structuredContent as {
+        pushed: boolean;
+        branch: string;
+      };
+      expect(sc.pushed).toBe(true);
+      expect(sc.branch).toMatch(/^(main|master)$/);
+    } finally {
+      await rm(remotePath, { recursive: true, force: true });
+    }
+  });
+});
