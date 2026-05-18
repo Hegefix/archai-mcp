@@ -11,11 +11,8 @@ import { registerDeleteFolder } from "./tools/delete_folder.js";
 import { registerListFolders } from "./tools/list_folders.js";
 import { registerFindBacklinks } from "./tools/find_backlinks.js";
 import { registerMove } from "./tools/move.js";
-import { registerGitStatus } from "./tools/git_status.js";
-import { registerGitCommit } from "./tools/git_commit.js";
 import { registerBulkMove } from "./tools/bulk_move.js";
 import { registerRewriteLinks } from "./tools/rewrite_links.js";
-import { registerGitPush } from "./tools/git_push.js";
 
 export function createServer(vaultPath: string): McpServer {
   const server = new McpServer({
@@ -36,11 +33,8 @@ export function createServer(vaultPath: string): McpServer {
   registerListFolders(server, vaultPath);
   registerFindBacklinks(server, vaultPath);
   registerMove(server, vaultPath);
-  registerGitStatus(server, vaultPath, git);
-  registerGitCommit(server, vaultPath, git);
   registerBulkMove(server, vaultPath, git);
   registerRewriteLinks(server, vaultPath);
-  registerGitPush(server, vaultPath, git);
 
   return server;
 }

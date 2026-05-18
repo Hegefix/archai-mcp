@@ -59,9 +59,8 @@ These keep the vault internally consistent when notes are renamed, moved, or reo
 | `move` | Move/rename a single note. Rewrites wikilinks across the vault when the basename changes, recomputes markdown-style relative links, bumps the moved note's `updated`. `dry_run`, `overwrite`, `allow_ambiguity` flags. |
 | `bulk_move` | Atomic batch of moves with `git reset --hard` rollback on failure. Topologically orders chained moves (A→B, B→C). Rejects cycles, duplicate destinations, and git-ignored sources. |
 | `rewrite_links` | Mass-rename a wikilink target without moving any files. Use when a note was renamed outside this server (e.g. in Obsidian's UI) and references broke. |
-| `git_status` | Branch, dirty flag, ahead/behind, and staged/modified/untracked file lists. Read-only. |
-| `git_commit` | `git add -A && git commit -m`. Returns `{committed:false, reason:'clean'}` on a clean tree unless `allow_empty:true`. |
-| `git_push` | Push to a remote. **Soft barrier:** the description tells the calling model not to invoke this unless the user explicitly asked for a push. Never uses `--force`. |
+
+Git inspection and push are intentionally NOT exposed as tools — use your terminal. `bulk_move` uses git internally for its snapshot/rollback safety net.
 
 #### Worked example: `bulk_move`
 
@@ -109,12 +108,11 @@ If the vault isn't a git repo and the default snapshot path is used, the tool er
 #### Caveats
 
 - **Concurrent edits during refactor are not handled.** Close Obsidian (or pause autosave) before running `bulk_move`; if Obsidian writes a file mid-operation, the snapshot rollback may overwrite that write.
-- `git_push` is the only tool that talks to a remote. It is never invoked automatically.
 - `find_backlinks` resolves wikilinks by basename (matches Obsidian). If two notes share a basename, `resolved_files.length > 1` — rename one of them before a basename-changing move.
 
-#### Required for git tools
+#### Required for `bulk_move`
 
-A `git` binary on `PATH`. The vault should be a git repo (`git init` in the vault root) if you want `git_status`, `git_commit`, `git_push`, or the default `bulk_move` snapshot path to work.
+A `git` binary on `PATH` and a git repo at the vault root (`git init` if needed), unless you pass `unsafe_no_snapshot: true`.
 
 ## Frontmatter
 

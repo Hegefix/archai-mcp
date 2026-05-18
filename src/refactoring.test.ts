@@ -365,127 +365,6 @@ describe("move", () => {
   });
 });
 
-describe("git_status", () => {
-  let vault: string;
-  let client: Client;
-  let close: () => Promise<void>;
-
-  beforeEach(async () => {
-    ({ vault, client, close } = await setupVault());
-  });
-
-  afterEach(async () => {
-    await close();
-  });
-
-  it("errors when vault is not a git repo", async () => {
-    const r = await callTool(client, "git_status");
-    expect(r.isError).toBe(true);
-    expect(getText(r)).toContain("not a git repository");
-  });
-
-  it("reports clean state after initial commit", async () => {
-    await initGitInVault(vault);
-    await writeNote(vault, "a.md", "hi");
-    const sg = simpleGit(vault);
-    await sg.add(["-A"]);
-    await sg.commit("init");
-
-    const r = await callTool(client, "git_status");
-    const sc = r.structuredContent as {
-      dirty: boolean;
-      staged: string[];
-      modified: string[];
-      untracked: string[];
-    };
-    expect(sc.dirty).toBe(false);
-    expect(sc.staged).toEqual([]);
-    expect(sc.modified).toEqual([]);
-    expect(sc.untracked).toEqual([]);
-  });
-
-  it("reports dirty state with file lists", async () => {
-    await initGitInVault(vault);
-    await writeNote(vault, "a.md", "v1");
-    const sg = simpleGit(vault);
-    await sg.add(["-A"]);
-    await sg.commit("init");
-
-    await writeFile(join(vault, "a.md"), "v2", "utf-8");
-    await writeFile(join(vault, "b.md"), "new", "utf-8");
-
-    const r = await callTool(client, "git_status");
-    const sc = r.structuredContent as {
-      dirty: boolean;
-      modified: string[];
-      untracked: string[];
-    };
-    expect(sc.dirty).toBe(true);
-    expect(sc.modified).toContain("a.md");
-    expect(sc.untracked).toContain("b.md");
-  });
-});
-
-describe("git_commit", () => {
-  let vault: string;
-  let client: Client;
-  let close: () => Promise<void>;
-
-  beforeEach(async () => {
-    ({ vault, client, close } = await setupVault());
-  });
-
-  afterEach(async () => {
-    await close();
-  });
-
-  it("errors when vault is not a git repo", async () => {
-    const r = await callTool(client, "git_commit", { message: "x" });
-    expect(r.isError).toBe(true);
-  });
-
-  it("returns clean reason on no changes", async () => {
-    await initGitInVault(vault);
-    await writeNote(vault, "a.md", "hi");
-    const sg = simpleGit(vault);
-    await sg.add(["-A"]);
-    await sg.commit("init");
-
-    const r = await callTool(client, "git_commit", { message: "nothing" });
-    const sc = r.structuredContent as {
-      committed: boolean;
-      reason?: string;
-    };
-    expect(sc.committed).toBe(false);
-    expect(sc.reason).toBe("clean");
-  });
-
-  it("commits dirty state", async () => {
-    await initGitInVault(vault);
-    await writeNote(vault, "a.md", "hi");
-
-    const r = await callTool(client, "git_commit", { message: "first" });
-    const sc = r.structuredContent as { committed: boolean; sha?: string };
-    expect(sc.committed).toBe(true);
-    expect(sc.sha).toMatch(/^[a-f0-9]{7,40}$/);
-  });
-
-  it("creates empty commit with allow_empty=true", async () => {
-    await initGitInVault(vault);
-    await writeNote(vault, "a.md", "hi");
-    const sg = simpleGit(vault);
-    await sg.add(["-A"]);
-    await sg.commit("init");
-
-    const r = await callTool(client, "git_commit", {
-      message: "marker",
-      allow_empty: true,
-    });
-    const sc = r.structuredContent as { committed: boolean };
-    expect(sc.committed).toBe(true);
-  });
-});
-
 describe("bulk_move", () => {
   let vault: string;
   let client: Client;
@@ -798,67 +677,6 @@ describe("rewrite_links", () => {
   });
 });
 
-describe("git_push", () => {
-  let vault: string;
-  let client: Client;
-  let close: () => Promise<void>;
-
-  beforeEach(async () => {
-    ({ vault, client, close } = await setupVault());
-  });
-
-  afterEach(async () => {
-    await close();
-  });
-
-  it("errors when vault is not a git repo", async () => {
-    const r = await callTool(client, "git_push");
-    expect(r.isError).toBe(true);
-  });
-
-  it("returns pushed=false with verbatim error when no remote configured", async () => {
-    await initGitInVault(vault);
-    await writeNote(vault, "a.md", "");
-    const sg = simpleGit(vault);
-    await sg.add(["-A"]);
-    await sg.commit("init");
-
-    const r = await callTool(client, "git_push");
-    expect(r.isError).toBe(true);
-    const sc = r.structuredContent as {
-      pushed: boolean;
-      error?: string;
-      remote: string;
-    };
-    expect(sc.pushed).toBe(false);
-    expect(sc.remote).toBe("origin");
-    expect(sc.error).toBeDefined();
-  });
-
-  it("pushes to a local bare remote", async () => {
-    const remotePath = await mkdtemp(join(tmpdir(), "archai-bare-"));
-    try {
-      await simpleGit(remotePath).init(true);
-      await initGitInVault(vault);
-      await writeNote(vault, "a.md", "");
-      const sg = simpleGit(vault);
-      await sg.add(["-A"]);
-      await sg.commit("init");
-      await sg.addRemote("origin", remotePath);
-
-      const r = await callTool(client, "git_push");
-      const sc = r.structuredContent as {
-        pushed: boolean;
-        branch: string;
-      };
-      expect(sc.pushed).toBe(true);
-      expect(sc.branch).toMatch(/^(main|master)$/);
-    } finally {
-      await rm(remotePath, { recursive: true, force: true });
-    }
-  });
-});
-
 describe("end-to-end: full refactor flow", () => {
   let vault: string;
   let client: Client;
@@ -902,11 +720,9 @@ describe("end-to-end: full refactor flow", () => {
     await sg.add(["-A"]);
     await sg.commit("initial vault state");
 
-    // 3. Pre-condition: clean status.
-    const preStatus = await callTool(client, "git_status");
-    expect(
-      (preStatus.structuredContent as { dirty: boolean }).dirty
-    ).toBe(false);
+    // 3. Pre-condition: clean status (verified directly via git).
+    const preStatus = await simpleGit(vault).status();
+    expect(preStatus.isClean()).toBe(true);
 
     // Dirty the tree so the snapshot will produce an actual commit.
     // (A clean tree → snapshot skips committing; rollback still works
