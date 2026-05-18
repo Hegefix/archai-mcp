@@ -359,20 +359,59 @@ describe("MCP tools", () => {
   });
 
   describe("create_folder", () => {
-    it("creates a folder with parents", async () => {
+    it("creates a folder with parents and reports created:true", async () => {
       const result = await callTool("create_folder", {
         path: "a/b/c",
       });
       expect(getText(result)).toContain("Created folder: a/b/c");
+      expect(result.structuredContent).toEqual({
+        created: true,
+        path: "a/b/c",
+      });
 
       const stats = await stat(join(vaultPath, "a/b/c"));
       expect(stats.isDirectory()).toBe(true);
     });
 
-    it("is idempotent", async () => {
-      await callTool("create_folder", { path: "x" });
-      const result = await callTool("create_folder", { path: "x" });
-      expect(getText(result)).toContain("Created folder: x");
+    it("is idempotent and reports created:false on the second call", async () => {
+      const first = await callTool("create_folder", { path: "x" });
+      expect(first.structuredContent).toEqual({ created: true, path: "x" });
+
+      const second = await callTool("create_folder", { path: "x" });
+      expect(getText(second)).toContain("Already exists: x");
+      expect(second.structuredContent).toEqual({ created: false, path: "x" });
+      expect(second.isError).toBeFalsy();
+    });
+
+    it("errors when target path collides with an existing file", async () => {
+      await writeFile(join(vaultPath, "afile.md"), "hi", "utf-8");
+      const result = await callTool("create_folder", { path: "afile.md" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("exists and is a file");
+    });
+
+    it("rejects absolute paths", async () => {
+      const result = await callTool("create_folder", { path: "/etc/foo" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toMatch(/absolute/);
+    });
+
+    it("rejects paths that escape vault root", async () => {
+      const result = await callTool("create_folder", { path: "../escape" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Path traversal");
+    });
+
+    it("normalizes paths with redundant segments", async () => {
+      const result = await callTool("create_folder", {
+        path: "./a/./b/../c",
+      });
+      expect(result.structuredContent).toEqual({
+        created: true,
+        path: "a/c",
+      });
+      const stats = await stat(join(vaultPath, "a/c"));
+      expect(stats.isDirectory()).toBe(true);
     });
   });
 
