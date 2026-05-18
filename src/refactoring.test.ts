@@ -4,7 +4,16 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { mkdtemp, rm, writeFile, readFile, mkdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { simpleGit } from "simple-git";
 import { createServer } from "./server.js";
+
+async function initGitInVault(vault: string): Promise<void> {
+  const sg = simpleGit(vault);
+  await sg.init();
+  await sg.addConfig("user.email", "test@archai.local");
+  await sg.addConfig("user.name", "Archai Test");
+  await sg.addConfig("commit.gpgsign", "false");
+}
 
 async function callTool(
   client: Client,
@@ -353,5 +362,126 @@ describe("move", () => {
     expect(sc.link_updates).toEqual([]);
     const a = await readFile(join(vault, "a.md"), "utf-8");
     expect(a).toBe("see [[old]]");
+  });
+});
+
+describe("git_status", () => {
+  let vault: string;
+  let client: Client;
+  let close: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ vault, client, close } = await setupVault());
+  });
+
+  afterEach(async () => {
+    await close();
+  });
+
+  it("errors when vault is not a git repo", async () => {
+    const r = await callTool(client, "git_status");
+    expect(r.isError).toBe(true);
+    expect(getText(r)).toContain("not a git repository");
+  });
+
+  it("reports clean state after initial commit", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "a.md", "hi");
+    const sg = simpleGit(vault);
+    await sg.add(["-A"]);
+    await sg.commit("init");
+
+    const r = await callTool(client, "git_status");
+    const sc = r.structuredContent as {
+      dirty: boolean;
+      staged: string[];
+      modified: string[];
+      untracked: string[];
+    };
+    expect(sc.dirty).toBe(false);
+    expect(sc.staged).toEqual([]);
+    expect(sc.modified).toEqual([]);
+    expect(sc.untracked).toEqual([]);
+  });
+
+  it("reports dirty state with file lists", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "a.md", "v1");
+    const sg = simpleGit(vault);
+    await sg.add(["-A"]);
+    await sg.commit("init");
+
+    await writeFile(join(vault, "a.md"), "v2", "utf-8");
+    await writeFile(join(vault, "b.md"), "new", "utf-8");
+
+    const r = await callTool(client, "git_status");
+    const sc = r.structuredContent as {
+      dirty: boolean;
+      modified: string[];
+      untracked: string[];
+    };
+    expect(sc.dirty).toBe(true);
+    expect(sc.modified).toContain("a.md");
+    expect(sc.untracked).toContain("b.md");
+  });
+});
+
+describe("git_commit", () => {
+  let vault: string;
+  let client: Client;
+  let close: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ vault, client, close } = await setupVault());
+  });
+
+  afterEach(async () => {
+    await close();
+  });
+
+  it("errors when vault is not a git repo", async () => {
+    const r = await callTool(client, "git_commit", { message: "x" });
+    expect(r.isError).toBe(true);
+  });
+
+  it("returns clean reason on no changes", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "a.md", "hi");
+    const sg = simpleGit(vault);
+    await sg.add(["-A"]);
+    await sg.commit("init");
+
+    const r = await callTool(client, "git_commit", { message: "nothing" });
+    const sc = r.structuredContent as {
+      committed: boolean;
+      reason?: string;
+    };
+    expect(sc.committed).toBe(false);
+    expect(sc.reason).toBe("clean");
+  });
+
+  it("commits dirty state", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "a.md", "hi");
+
+    const r = await callTool(client, "git_commit", { message: "first" });
+    const sc = r.structuredContent as { committed: boolean; sha?: string };
+    expect(sc.committed).toBe(true);
+    expect(sc.sha).toMatch(/^[a-f0-9]{7,40}$/);
+  });
+
+  it("creates empty commit with allow_empty=true", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "a.md", "hi");
+    const sg = simpleGit(vault);
+    await sg.add(["-A"]);
+    await sg.commit("init");
+
+    const r = await callTool(client, "git_commit", {
+      message: "marker",
+      allow_empty: true,
+    });
+    const sc = r.structuredContent as { committed: boolean };
+    expect(sc.committed).toBe(true);
   });
 });
