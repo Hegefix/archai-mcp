@@ -4,15 +4,36 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { mkdtemp, rm, writeFile, readFile, mkdir, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { simpleGit } from "simple-git";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { createServer } from "./server.js";
 
+const execFileP = promisify(execFile);
+
+async function git(cwd: string, ...args: string[]): Promise<string> {
+  const { stdout } = await execFileP("git", args, { cwd });
+  return stdout;
+}
+
 async function initGitInVault(vault: string): Promise<void> {
-  const sg = simpleGit(vault);
-  await sg.init();
-  await sg.addConfig("user.email", "test@archai.local");
-  await sg.addConfig("user.name", "Archai Test");
-  await sg.addConfig("commit.gpgsign", "false");
+  await git(vault, "init");
+  await git(vault, "config", "user.email", "test@archai.local");
+  await git(vault, "config", "user.name", "Archai Test");
+  await git(vault, "config", "commit.gpgsign", "false");
+}
+
+async function gitAddCommit(vault: string, message: string): Promise<void> {
+  await git(vault, "add", "-A");
+  await git(vault, "commit", "-m", message);
+}
+
+async function gitLogCount(vault: string): Promise<number> {
+  const out = await git(vault, "rev-list", "--count", "HEAD");
+  return parseInt(out.trim(), 10);
+}
+
+async function gitLatestMessage(vault: string): Promise<string> {
+  return (await git(vault, "log", "-1", "--pretty=%s")).trim();
 }
 
 async function callTool(
@@ -412,9 +433,7 @@ describe("bulk_move", () => {
     await writeNote(vault, "public/scratch/b.md", "ref to [[c]]");
     await writeNote(vault, "public/scratch/c.md", "leaf");
     await writeNote(vault, "ref.md", "external [[a]] and [[b]]");
-    const sg = simpleGit(vault);
-    await sg.add(["-A"]);
-    await sg.commit("init");
+    await gitAddCommit(vault, "init");
 
     const r = await callTool(client, "bulk_move", {
       operations: [
@@ -526,9 +545,8 @@ describe("bulk_move", () => {
     await initGitInVault(vault);
     await writeNote(vault, "secret.md", "shh");
     await writeFile(join(vault, ".gitignore"), "secret.md\n", "utf-8");
-    const sg = simpleGit(vault);
-    await sg.add([".gitignore"]);
-    await sg.commit("ignore");
+    await git(vault, "add", ".gitignore");
+    await git(vault, "commit", "-m", "ignore");
 
     const r = await callTool(client, "bulk_move", {
       operations: [{ from: "secret.md", to: "moved.md" }],
@@ -540,9 +558,7 @@ describe("bulk_move", () => {
   it("captures untracked from files in the snapshot and rolls back on error", async () => {
     await initGitInVault(vault);
     await writeNote(vault, "existing.md", "v1");
-    const sg = simpleGit(vault);
-    await sg.add(["-A"]);
-    await sg.commit("init");
+    await gitAddCommit(vault, "init");
 
     // Untracked from file
     await writeNote(vault, "fresh.md", "untracked");
@@ -569,9 +585,7 @@ describe("bulk_move", () => {
     await initGitInVault(vault);
     await writeNote(vault, "a.md", "[[b]]");
     await writeNote(vault, "b.md", "leaf");
-    const sg = simpleGit(vault);
-    await sg.add(["-A"]);
-    await sg.commit("init");
+    await gitAddCommit(vault, "init");
 
     const r = await callTool(client, "bulk_move", {
       operations: [{ from: "b.md", to: "renamed.md" }],
@@ -587,16 +601,13 @@ describe("bulk_move", () => {
     expect(sc.total_link_updates).toBe(1);
     await expect(stat(join(vault, "b.md"))).resolves.toBeDefined();
     await expect(stat(join(vault, "renamed.md"))).rejects.toThrow();
-    const log = await simpleGit(vault).log();
-    expect(log.total).toBe(1);
+    expect(await gitLogCount(vault)).toBe(1);
   });
 
   it("returns a single snapshot commit; does not auto-followup", async () => {
     await initGitInVault(vault);
     await writeNote(vault, "a.md", "");
-    const sg = simpleGit(vault);
-    await sg.add(["-A"]);
-    await sg.commit("init");
+    await gitAddCommit(vault, "init");
     // Make state dirty so the snapshot will actually commit:
     await writeNote(vault, "extra.md", "");
 
@@ -605,8 +616,7 @@ describe("bulk_move", () => {
     });
     const sc = r.structuredContent as { snapshot_sha?: string };
     expect(sc.snapshot_sha).toBeDefined();
-    const log = await simpleGit(vault).log();
-    expect(log.total).toBe(2); // init + snapshot, no auto-followup
+    expect(await gitLogCount(vault)).toBe(2); // init + snapshot
   });
 
   it("unsafe_no_snapshot=true works without git", async () => {
@@ -725,13 +735,10 @@ describe("end-to-end: full refactor flow", () => {
 
     // 2. git init + initial commit.
     await initGitInVault(vault);
-    const sg = simpleGit(vault);
-    await sg.add(["-A"]);
-    await sg.commit("initial vault state");
+    await gitAddCommit(vault, "initial vault state");
 
     // 3. Pre-condition: clean status (verified directly via git).
-    const preStatus = await simpleGit(vault).status();
-    expect(preStatus.isClean()).toBe(true);
+    expect((await git(vault, "status", "--porcelain")).trim()).toBe("");
 
     // Dirty the tree so the snapshot will produce an actual commit.
     // (A clean tree → snapshot skips committing; rollback still works
@@ -808,8 +815,9 @@ describe("end-to-end: full refactor flow", () => {
     expect(external).not.toContain("updated:"); // never had frontmatter, no bump
 
     // 8. Exactly one new commit (snapshot) — bulk_move does NOT auto-followup.
-    const log = await sg.log();
-    expect(log.total).toBe(2);
-    expect(log.latest?.message).toBe("archai: pre-refactor snapshot");
+    expect(await gitLogCount(vault)).toBe(2);
+    expect(await gitLatestMessage(vault)).toBe(
+      "archai: pre-refactor snapshot"
+    );
   });
 });

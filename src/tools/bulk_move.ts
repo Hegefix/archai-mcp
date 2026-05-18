@@ -2,6 +2,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v3";
 import { readFile, writeFile, unlink, mkdir, stat } from "node:fs/promises";
 import { dirname } from "node:path";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import {
   resolveVaultPath,
   getAllMarkdownFiles,
@@ -14,7 +16,63 @@ import {
   rewriteMarkdownLinksByPathMap,
   bumpUpdated,
 } from "../refactor.js";
-import { createGit, type GitClient } from "../git.js";
+
+const execFileP = promisify(execFile);
+
+async function gitIsRepo(cwd: string): Promise<boolean> {
+  try {
+    await execFileP("git", ["rev-parse", "--is-inside-work-tree"], { cwd });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function gitIsClean(cwd: string): Promise<boolean> {
+  const { stdout } = await execFileP("git", ["status", "--porcelain"], {
+    cwd,
+  });
+  return stdout.trim() === "";
+}
+
+async function gitSnapshot(
+  cwd: string,
+  message: string
+): Promise<{ committed: boolean; sha?: string }> {
+  if (await gitIsClean(cwd)) return { committed: false };
+  await execFileP("git", ["add", "-A"], { cwd });
+  await execFileP("git", ["commit", "-m", message], { cwd });
+  const { stdout } = await execFileP("git", ["rev-parse", "HEAD"], { cwd });
+  return { committed: true, sha: stdout.trim() };
+}
+
+async function gitResetHard(cwd: string): Promise<void> {
+  await execFileP("git", ["reset", "--hard", "HEAD"], { cwd });
+  await execFileP("git", ["clean", "-fd"], { cwd });
+}
+
+async function gitIsIgnored(
+  cwd: string,
+  paths: string[]
+): Promise<string[]> {
+  if (paths.length === 0) return [];
+  try {
+    const { stdout } = await execFileP(
+      "git",
+      ["check-ignore", "--", ...paths],
+      { cwd }
+    );
+    return stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+  } catch (err) {
+    // `git check-ignore` exits with code 1 when no paths match.
+    const code = (err as { code?: number }).code;
+    if (code === 1) return [];
+    throw err;
+  }
+}
 
 interface NormalizedOp {
   from: string;
@@ -52,11 +110,8 @@ function errText(msg: string): Resp {
 
 export function registerBulkMove(
   server: McpServer,
-  vaultPath: string,
-  gitClient?: GitClient
+  vaultPath: string
 ): void {
-  const git = gitClient ?? createGit(vaultPath);
-
   server.registerTool(
     "bulk_move",
     {
@@ -236,10 +291,13 @@ export function registerBulkMove(
 
       // Snapshot coverage check
       if (useSnapshot) {
-        if (!(await git.isRepo())) {
+        if (!(await gitIsRepo(vaultPath))) {
           return errText(NON_REPO_MSG(vaultPath));
         }
-        const ignored = await git.isIgnored(realOps.map((op) => op.from));
+        const ignored = await gitIsIgnored(
+          vaultPath,
+          realOps.map((op) => op.from)
+        );
         if (ignored.length > 0) {
           return errText(
             `${ignored.join(", ")} is git-ignored; the snapshot would not capture it. Untrack the ignore or pass unsafe_no_snapshot:true.`
@@ -288,7 +346,7 @@ export function registerBulkMove(
       // Real run
       let snapshot_sha: string | undefined;
       if (useSnapshot) {
-        const snap = await git.snapshot(snapshot_message);
+        const snap = await gitSnapshot(vaultPath, snapshot_message);
         if (snap.committed) snapshot_sha = snap.sha;
       }
 
@@ -330,7 +388,7 @@ export function registerBulkMove(
         ];
         if (useSnapshot) {
           try {
-            await git.resetHard();
+            await gitResetHard(vaultPath);
             return {
               content: [
                 {

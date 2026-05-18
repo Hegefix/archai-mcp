@@ -1,5 +1,4 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { createGit } from "./git.js";
 import { registerSave } from "./tools/save.js";
 import { registerRead } from "./tools/read.js";
 import { registerSearch } from "./tools/search.js";
@@ -20,8 +19,6 @@ export function createServer(vaultPath: string): McpServer {
     version: "1.0.0",
   });
 
-  const git = createGit(vaultPath);
-
   registerSave(server, vaultPath);
   registerRead(server, vaultPath);
   registerSearch(server, vaultPath);
@@ -33,7 +30,7 @@ export function createServer(vaultPath: string): McpServer {
   registerListFolders(server, vaultPath);
   registerFindBacklinks(server, vaultPath);
   registerMove(server, vaultPath);
-  registerBulkMove(server, vaultPath, git);
+  registerBulkMove(server, vaultPath);
   registerRewriteLinks(server, vaultPath);
 
   return server;

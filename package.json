@@ -19,8 +19,7 @@
     "gray-matter": "^4.0.3",
     "mdast-util-from-markdown": "^2.0.3",
     "mdast-util-frontmatter": "^2.0.1",
-    "micromark-extension-frontmatter": "^2.0.0",
-    "simple-git": "^3.36.0"
+    "micromark-extension-frontmatter": "^2.0.0"
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
