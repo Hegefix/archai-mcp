@@ -9,6 +9,7 @@ import { registerCreateFolder } from "./tools/create_folder.js";
 import { registerDeleteFolder } from "./tools/delete_folder.js";
 import { registerListFolders } from "./tools/list_folders.js";
 import { registerFindBacklinks } from "./tools/find_backlinks.js";
+import { registerMove } from "./tools/move.js";
 
 export function createServer(vaultPath: string): McpServer {
   const server = new McpServer({
@@ -26,6 +27,7 @@ export function createServer(vaultPath: string): McpServer {
   registerDeleteFolder(server, vaultPath);
   registerListFolders(server, vaultPath);
   registerFindBacklinks(server, vaultPath);
+  registerMove(server, vaultPath);
 
   return server;
 }
