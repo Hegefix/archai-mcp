@@ -858,3 +858,133 @@ describe("git_push", () => {
     }
   });
 });
+
+describe("end-to-end: full refactor flow", () => {
+  let vault: string;
+  let client: Client;
+  let close: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ vault, client, close } = await setupVault());
+  });
+
+  afterEach(async () => {
+    await close();
+  });
+
+  it("reorganizes a cross-linked set of notes with one snapshot commit and no auto-followup", async () => {
+    // 1. Build the fixture: three cross-linked notes + an external reference.
+    //    One destination basename changes so we exercise wikilink rewriting.
+    await writeNote(
+      vault,
+      "public/scratch/alpha.md",
+      "---\ntitle: Alpha\nupdated: 2020-01-01\n---\nrefers to [[beta]] and [[gamma]] and an md link [g](./gamma.md)"
+    );
+    await writeNote(
+      vault,
+      "public/scratch/beta.md",
+      "---\ntitle: Beta\nupdated: 2020-01-01\n---\nrefers to [[gamma]]"
+    );
+    await writeNote(
+      vault,
+      "public/scratch/gamma.md",
+      "---\ntitle: Gamma\nupdated: 2020-01-01\n---\nleaf"
+    );
+    await writeNote(
+      vault,
+      "external.md",
+      "see [[alpha]] and [[gamma|the leaf]]"
+    );
+
+    // 2. git init + initial commit.
+    await initGitInVault(vault);
+    const sg = simpleGit(vault);
+    await sg.add(["-A"]);
+    await sg.commit("initial vault state");
+
+    // 3. Pre-condition: clean status.
+    const preStatus = await callTool(client, "git_status");
+    expect(
+      (preStatus.structuredContent as { dirty: boolean }).dirty
+    ).toBe(false);
+
+    // Dirty the tree so the snapshot will produce an actual commit.
+    // (A clean tree → snapshot skips committing; rollback still works
+    // via reset to HEAD, but we want to assert against the SHA here.)
+    await writeNote(vault, "scratchpad.md", "throwaway");
+
+    // 4. Bulk move + rename gamma → delta (basename change).
+    const bulk = await callTool(client, "bulk_move", {
+      operations: [
+        {
+          from: "public/scratch/alpha.md",
+          to: "public/concepts/alpha.md",
+        },
+        {
+          from: "public/scratch/beta.md",
+          to: "public/concepts/beta.md",
+        },
+        {
+          from: "public/scratch/gamma.md",
+          to: "public/concepts/delta.md",
+        },
+      ],
+    });
+    const bsc = bulk.structuredContent as {
+      success: boolean;
+      results: Array<{ moved: boolean }>;
+      total_link_updates: number;
+      snapshot_sha: string;
+      rolled_back: boolean;
+    };
+    expect(bsc.success).toBe(true);
+    expect(bsc.rolled_back).toBe(false);
+    expect(bsc.results.length).toBe(3);
+    expect(bsc.results.every((r) => r.moved)).toBe(true);
+    expect(bsc.snapshot_sha).toMatch(/^[a-f0-9]{7,40}$/);
+    // gamma → delta means 3 wikilink rewrites (alpha references gamma,
+    // beta references gamma, external references gamma|alias) plus the
+    // markdown-style link from alpha.
+    expect(bsc.total_link_updates).toBeGreaterThanOrEqual(4);
+
+    // 5. Verify wikilinks resolve at the new locations.
+    const movedAlpha = await readFile(
+      join(vault, "public/concepts/alpha.md"),
+      "utf-8"
+    );
+    expect(movedAlpha).toContain("[[beta]]");
+    expect(movedAlpha).toContain("[[delta]]");
+    // The outgoing markdown link was recomputed relative to the new
+    // location (gamma moved to delta in the same dir, so it's "delta.md"):
+    expect(movedAlpha).toContain("(delta.md)");
+
+    const movedBeta = await readFile(
+      join(vault, "public/concepts/beta.md"),
+      "utf-8"
+    );
+    expect(movedBeta).toContain("[[delta]]");
+
+    const external = await readFile(join(vault, "external.md"), "utf-8");
+    expect(external).toBe("see [[alpha]] and [[delta|the leaf]]");
+
+    // 6. Original locations are gone, scratch folder no longer has these notes.
+    for (const f of [
+      "public/scratch/alpha.md",
+      "public/scratch/beta.md",
+      "public/scratch/gamma.md",
+    ]) {
+      await expect(stat(join(vault, f))).rejects.toThrow();
+    }
+
+    // 7. The moved files have a bumped `updated` field; backlink-only
+    //    notes (external.md) do not.
+    const today = new Date().toISOString().split("T")[0];
+    expect(movedAlpha).toMatch(new RegExp(`updated:\\s*['"]?${today}['"]?`));
+    expect(external).not.toContain("updated:"); // never had frontmatter, no bump
+
+    // 8. Exactly one new commit (snapshot) — bulk_move does NOT auto-followup.
+    const log = await sg.log();
+    expect(log.total).toBe(2);
+    expect(log.latest?.message).toBe("archai: pre-refactor snapshot");
+  });
+});
