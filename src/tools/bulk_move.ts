@@ -465,13 +465,15 @@ function rewriteContentForMaps(
       }
     }
   }
-  const ml = rewriteMarkdownLinksByPathMap(current, notePath, pathMap);
+  const ml = rewriteMarkdownLinksByPathMap(
+    current,
+    notePath,
+    pathMap,
+    attribution
+  );
   if (ml.updates.length > 0) {
     current = ml.content;
     count += ml.updates.length;
-    // Attribute markdown link updates by re-resolving each ref's URL against
-    // pathMap. This is approximate — we lose the exact original URL — but each
-    // update corresponds to exactly one entry in pathMap.
   }
   return { content: current, count };
 }
@@ -505,21 +507,49 @@ async function applyMoves(
     const toFull = resolveVaultPath(vaultPath, op.to);
     let content = await readFile(fromFull, "utf-8");
 
-    let count = 0;
+    let totalForFile = 0;
     if (updateLinks) {
-      // Wikilink rewrites
+      // Wikilink rewrites — attribute by basename → original op
       for (const [fromB, toB] of basenameMap) {
         const r = rewriteWikilinks(content, fromB, toB);
         if (r.updates.length > 0) {
           content = r.content;
-          count += r.updates.length;
+          totalForFile += r.updates.length;
+          const opFrom = basenameToOpFrom.get(fromB);
+          if (opFrom) {
+            attribution.set(
+              opFrom,
+              (attribution.get(opFrom) ?? 0) + r.updates.length
+            );
+          }
         }
       }
-      // Outgoing markdown links: recompute relative to new location AND
-      // remap any target that itself moved.
-      const ml = recomputeMovedFileLinks(content, op.from, op.to, pathMap);
+      // Outgoing markdown links: recompute relative to new location, remap
+      // any target that itself moved. mdHits records per-old-path counts for
+      // markdown links pointing at moved targets; the remainder is "source
+      // relocation only" recomputes and is attributed to the current op.
+      const mdHits = new Map<string, number>();
+      const ml = recomputeMovedFileLinks(
+        content,
+        op.from,
+        op.to,
+        pathMap,
+        mdHits
+      );
       content = ml.content;
-      count += ml.updates.length;
+      totalForFile += ml.updates.length;
+      let mdMovedTotal = 0;
+      for (const [oldPath, c] of mdHits) {
+        attribution.set(oldPath, (attribution.get(oldPath) ?? 0) + c);
+        mdMovedTotal += c;
+      }
+      const sourceReloc = ml.updates.length - mdMovedTotal;
+      if (sourceReloc > 0) {
+        attribution.set(
+          op.from,
+          (attribution.get(op.from) ?? 0) + sourceReloc
+        );
+      }
     }
     content = bumpUpdated(content);
 
@@ -534,8 +564,7 @@ async function applyMoves(
     }
 
     results[i]!.moved = true;
-    results[i]!.link_updates_count = count;
-    totalLinkUpdates += count;
+    totalLinkUpdates += totalForFile;
   }
 
   // Phase 2: rewrite incoming links in remaining files
@@ -560,6 +589,12 @@ async function applyMoves(
         totalLinkUpdates += count;
       }
     }
+  }
+
+  // Fold per-op attribution into results.
+  for (let i = 0; i < results.length; i++) {
+    const op = order[i]!;
+    results[i]!.link_updates_count = attribution.get(op.from) ?? 0;
   }
 
   return { results, totalLinkUpdates };
@@ -592,20 +627,45 @@ async function simulate(
     const op = order[i]!;
     const fromFull = resolveVaultPath(vaultPath, op.from);
     let content = await readFile(fromFull, "utf-8");
-    let count = 0;
+    let totalForFile = 0;
     if (updateLinks) {
       for (const [fromB, toB] of basenameMap) {
         const r = rewriteWikilinks(content, fromB, toB);
         if (r.updates.length > 0) {
           content = r.content;
-          count += r.updates.length;
+          totalForFile += r.updates.length;
+          const opFrom = basenameToOpFrom.get(fromB);
+          if (opFrom) {
+            attribution.set(
+              opFrom,
+              (attribution.get(opFrom) ?? 0) + r.updates.length
+            );
+          }
         }
       }
-      const ml = recomputeMovedFileLinks(content, op.from, op.to, pathMap);
-      count += ml.updates.length;
+      const mdHits = new Map<string, number>();
+      const ml = recomputeMovedFileLinks(
+        content,
+        op.from,
+        op.to,
+        pathMap,
+        mdHits
+      );
+      totalForFile += ml.updates.length;
+      let mdMovedTotal = 0;
+      for (const [oldPath, c] of mdHits) {
+        attribution.set(oldPath, (attribution.get(oldPath) ?? 0) + c);
+        mdMovedTotal += c;
+      }
+      const sourceReloc = ml.updates.length - mdMovedTotal;
+      if (sourceReloc > 0) {
+        attribution.set(
+          op.from,
+          (attribution.get(op.from) ?? 0) + sourceReloc
+        );
+      }
     }
-    results[i]!.link_updates_count = count;
-    totalLinkUpdates += count;
+    totalLinkUpdates += totalForFile;
   }
 
   // Simulate phase 2
@@ -626,6 +686,11 @@ async function simulate(
       );
       totalLinkUpdates += count;
     }
+  }
+
+  for (let i = 0; i < results.length; i++) {
+    const op = order[i]!;
+    results[i]!.link_updates_count = attribution.get(op.from) ?? 0;
   }
 
   return { results, totalLinkUpdates };

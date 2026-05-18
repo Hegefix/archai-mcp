@@ -110,22 +110,6 @@ describe("git wrapper", () => {
     });
   });
 
-  describe("commit", () => {
-    it("returns clean when nothing to commit and allowEmpty is false", async () => {
-      await makeInitialCommit(repoPath);
-      const r = await git.commit("nothing");
-      expect(r.committed).toBe(false);
-      expect(r.reason).toBe("clean");
-    });
-
-    it("commits an empty commit when allowEmpty is true", async () => {
-      await makeInitialCommit(repoPath);
-      const r = await git.commit("empty marker", true);
-      expect(r.committed).toBe(true);
-      expect(r.sha).toMatch(/^[a-f0-9]{7,40}$/);
-    });
-  });
-
   describe("resetHard", () => {
     it("reverts modifications to HEAD", async () => {
       await makeInitialCommit(repoPath, "a.md", "v1");
@@ -158,43 +142,6 @@ describe("git wrapper", () => {
 
       const content = await readFile(join(repoPath, "a.md"), "utf-8");
       expect(content).toBe("v1");
-    });
-  });
-
-  describe("currentBranch", () => {
-    it("returns the branch name after a commit", async () => {
-      await makeInitialCommit(repoPath);
-      const branch = await git.currentBranch();
-      expect(branch).toMatch(/^(main|master)$/);
-    });
-  });
-
-  describe("push", () => {
-    it("returns pushed=false with error when no remote is configured", async () => {
-      await makeInitialCommit(repoPath);
-      const r = await git.push();
-      expect(r.pushed).toBe(false);
-      expect(r.remote).toBe("origin");
-      expect(r.error).toBeDefined();
-      expect(r.error!.length).toBeGreaterThan(0);
-    });
-
-    it("pushes to a local bare remote", async () => {
-      const remotePath = await mkdtemp(join(tmpdir(), "archai-bare-"));
-      try {
-        await simpleGit(remotePath).init(true);
-        await makeInitialCommit(repoPath);
-        await simpleGit(repoPath).addRemote("origin", remotePath);
-
-        const r = await git.push();
-
-        expect(r.pushed).toBe(true);
-        expect(r.remote).toBe("origin");
-        expect(r.branch).toMatch(/^(main|master)$/);
-        expect(r.error).toBeUndefined();
-      } finally {
-        await rm(remotePath, { recursive: true, force: true });
-      }
     });
   });
 

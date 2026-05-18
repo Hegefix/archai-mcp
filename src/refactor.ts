@@ -33,36 +33,32 @@ export function resolveMarkdownLinkUrl(
   return joined;
 }
 
-export function recomputeOutgoingMarkdownLinks(
-  content: string,
-  oldNotePath: string,
-  newNotePath: string
-): { content: string; updates: LinkUpdate[] } {
-  return rewriteMarkdownLinks(content, (url) => {
-    const resolved = resolveMarkdownLinkUrl(oldNotePath, url);
-    if (resolved === null) return null;
-    return relativeFromTo(newNotePath, resolved);
-  });
-}
-
 export function recomputeMovedFileLinks(
   content: string,
   oldNotePath: string,
   newNotePath: string,
-  pathMap: Map<string, string>
+  pathMap: Map<string, string>,
+  counts?: Map<string, number>
 ): { content: string; updates: LinkUpdate[] } {
   return rewriteMarkdownLinks(content, (url) => {
     const resolved = resolveMarkdownLinkUrl(oldNotePath, url);
     if (resolved === null) return null;
-    const newTarget = pathMap.get(resolved) ?? resolved;
-    return relativeFromTo(newNotePath, newTarget);
+    const moved = pathMap.has(resolved);
+    const target = moved ? pathMap.get(resolved)! : resolved;
+    const newUrl = relativeFromTo(newNotePath, target);
+    if (newUrl === url) return null;
+    if (counts && moved) {
+      counts.set(resolved, (counts.get(resolved) ?? 0) + 1);
+    }
+    return newUrl;
   });
 }
 
 export function rewriteMarkdownLinksByPathMap(
   content: string,
   notePath: string,
-  pathMap: Map<string, string>
+  pathMap: Map<string, string>,
+  counts?: Map<string, number>
 ): { content: string; updates: LinkUpdate[] } {
   if (pathMap.size === 0) return { content, updates: [] };
   return rewriteMarkdownLinks(content, (url) => {
@@ -70,6 +66,7 @@ export function rewriteMarkdownLinksByPathMap(
     if (resolved === null) return null;
     const newPath = pathMap.get(resolved);
     if (newPath === undefined) return null;
+    if (counts) counts.set(resolved, (counts.get(resolved) ?? 0) + 1);
     return relativeFromTo(notePath, newPath);
   });
 }

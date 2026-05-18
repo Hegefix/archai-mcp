@@ -10,7 +10,7 @@ import {
 } from "../paths.js";
 import { rewriteWikilinks } from "../wikilinks.js";
 import {
-  recomputeOutgoingMarkdownLinks,
+  recomputeMovedFileLinks,
   rewriteMarkdownLinksByPathMap,
   bumpUpdated,
   findAmbiguityConflicts,
@@ -160,12 +160,17 @@ export function registerMove(server: McpServer, vaultPath: string): void {
         }
       }
 
-      const outgoing = recomputeOutgoingMarkdownLinks(fromContent, from, to);
+      const pathMap = new Map<string, string>([[from, to]]);
+      const outgoing = recomputeMovedFileLinks(
+        fromContent,
+        from,
+        to,
+        pathMap
+      );
       const movedContent = bumpUpdated(outgoing.content);
 
       const linkUpdates: LinkUpdateRecord[] = [];
       const backlinkWrites = new Map<string, string>();
-      const pathMap = new Map<string, string>([[from, to]]);
 
       if (update_links) {
         const files = await getAllMarkdownFiles(vaultPath);

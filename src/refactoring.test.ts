@@ -350,6 +350,15 @@ describe("move", () => {
     expect(ref).toContain("[[new]]");
   });
 
+  it("rewrites self-referential markdown link inside the moved note", async () => {
+    await writeNote(vault, "old.md", "[me](./old.md) and body");
+    await callTool(client, "move", { from: "old.md", to: "new.md" });
+    const moved = await readFile(join(vault, "new.md"), "utf-8");
+    expect(moved).toContain("(new.md)");
+    expect(moved).not.toContain("(./old.md)");
+    expect(moved).not.toContain("(old.md)");
+  });
+
   it("update_links=false skips backlink updates", async () => {
     await writeNote(vault, "a.md", "see [[old]]");
     await writeNote(vault, "old.md", "body");
