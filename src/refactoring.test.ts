@@ -485,3 +485,252 @@ describe("git_commit", () => {
     expect(sc.committed).toBe(true);
   });
 });
+
+describe("bulk_move", () => {
+  let vault: string;
+  let client: Client;
+  let close: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ vault, client, close } = await setupVault());
+  });
+
+  afterEach(async () => {
+    await close();
+  });
+
+  it("rejects snapshot:false without unsafe_no_snapshot", async () => {
+    const r = await callTool(client, "bulk_move", {
+      operations: [{ from: "a.md", to: "b.md" }],
+      snapshot: false,
+    });
+    expect(r.isError).toBe(true);
+    expect(getText(r)).toContain("unsafe_no_snapshot");
+  });
+
+  it("errors with non-git message when default snapshot path used in a non-git vault", async () => {
+    await writeNote(vault, "a.md", "v");
+    const r = await callTool(client, "bulk_move", {
+      operations: [{ from: "a.md", to: "b.md" }],
+    });
+    expect(r.isError).toBe(true);
+    expect(getText(r)).toContain("not a git repository");
+    expect(getText(r)).toContain("unsafe_no_snapshot");
+  });
+
+  it("moves three files with cross-links atomically", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "public/scratch/a.md", "see [[b]] and [[c]]");
+    await writeNote(vault, "public/scratch/b.md", "ref to [[c]]");
+    await writeNote(vault, "public/scratch/c.md", "leaf");
+    await writeNote(vault, "ref.md", "external [[a]] and [[b]]");
+    const sg = simpleGit(vault);
+    await sg.add(["-A"]);
+    await sg.commit("init");
+
+    const r = await callTool(client, "bulk_move", {
+      operations: [
+        { from: "public/scratch/a.md", to: "public/concepts/a.md" },
+        { from: "public/scratch/b.md", to: "public/concepts/b.md" },
+        { from: "public/scratch/c.md", to: "public/concepts/c.md" },
+      ],
+    });
+    const sc = r.structuredContent as {
+      success: boolean;
+      results: Array<{ moved: boolean }>;
+      total_link_updates: number;
+      rolled_back: boolean;
+      snapshot_sha?: string;
+    };
+    expect(sc.success).toBe(true);
+    expect(sc.results.every((x) => x.moved)).toBe(true);
+    expect(sc.rolled_back).toBe(false);
+    // Basenames didn't change, so wikilinks don't need rewriting.
+    expect(sc.total_link_updates).toBe(0);
+
+    for (const f of ["a", "b", "c"]) {
+      await expect(
+        stat(join(vault, `public/scratch/${f}.md`))
+      ).rejects.toThrow();
+      await expect(
+        stat(join(vault, `public/concepts/${f}.md`))
+      ).resolves.toBeDefined();
+    }
+    // ref.md still references basenames unchanged
+    const ref = await readFile(join(vault, "ref.md"), "utf-8");
+    expect(ref).toContain("[[a]]");
+  });
+
+  it("rewrites wikilinks when basenames change", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "old1.md", "see [[old2]]");
+    await writeNote(vault, "old2.md", "leaf");
+    await writeNote(vault, "ref.md", "use [[old1]] then [[old2]]");
+
+    const r = await callTool(client, "bulk_move", {
+      operations: [
+        { from: "old1.md", to: "new1.md" },
+        { from: "old2.md", to: "new2.md" },
+      ],
+    });
+    const sc = r.structuredContent as {
+      success: boolean;
+      total_link_updates: number;
+    };
+    expect(sc.success).toBe(true);
+    expect(sc.total_link_updates).toBeGreaterThanOrEqual(3);
+
+    const ref = await readFile(join(vault, "ref.md"), "utf-8");
+    expect(ref).toBe("use [[new1]] then [[new2]]");
+    const moved1 = await readFile(join(vault, "new1.md"), "utf-8");
+    expect(moved1).toContain("[[new2]]");
+  });
+
+  it("orders chained moves topologically (A→B, B→C)", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "A.md", "A-content");
+    await writeNote(vault, "B.md", "B-content");
+
+    const r = await callTool(client, "bulk_move", {
+      operations: [
+        { from: "A.md", to: "B.md" },
+        { from: "B.md", to: "C.md" },
+      ],
+    });
+    const sc = r.structuredContent as { success: boolean };
+    expect(sc.success).toBe(true);
+    const cContent = await readFile(join(vault, "C.md"), "utf-8");
+    expect(cContent).toBe("B-content");
+    const bContent = await readFile(join(vault, "B.md"), "utf-8");
+    expect(bContent).toBe("A-content");
+    await expect(stat(join(vault, "A.md"))).rejects.toThrow();
+  });
+
+  it("rejects cycles", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "A.md", "A");
+    await writeNote(vault, "B.md", "B");
+    const r = await callTool(client, "bulk_move", {
+      operations: [
+        { from: "A.md", to: "B.md" },
+        { from: "B.md", to: "A.md" },
+      ],
+    });
+    expect(r.isError).toBe(true);
+    expect(getText(r)).toContain("Cycle");
+  });
+
+  it("rejects duplicate destinations", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "A.md", "");
+    await writeNote(vault, "B.md", "");
+    const r = await callTool(client, "bulk_move", {
+      operations: [
+        { from: "A.md", to: "X.md" },
+        { from: "B.md", to: "X.md" },
+      ],
+    });
+    expect(r.isError).toBe(true);
+    expect(getText(r)).toContain("Duplicate destination");
+  });
+
+  it("rejects git-ignored from paths", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "secret.md", "shh");
+    await writeFile(join(vault, ".gitignore"), "secret.md\n", "utf-8");
+    const sg = simpleGit(vault);
+    await sg.add([".gitignore"]);
+    await sg.commit("ignore");
+
+    const r = await callTool(client, "bulk_move", {
+      operations: [{ from: "secret.md", to: "moved.md" }],
+    });
+    expect(r.isError).toBe(true);
+    expect(getText(r)).toContain("git-ignored");
+  });
+
+  it("captures untracked from files in the snapshot and rolls back on error", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "existing.md", "v1");
+    const sg = simpleGit(vault);
+    await sg.add(["-A"]);
+    await sg.commit("init");
+
+    // Untracked from file
+    await writeNote(vault, "fresh.md", "untracked");
+
+    // We need to induce a failure. Easiest: make the destination collide with
+    // an unwritable parent. Approach: pre-create a file at a nested-parent
+    // location used by `to`, blocking mkdir.
+    await writeFile(join(vault, "blocker"), "in-the-way", "utf-8");
+
+    const r = await callTool(client, "bulk_move", {
+      operations: [{ from: "fresh.md", to: "blocker/moved.md" }],
+    });
+    expect(r.isError).toBe(true);
+    const sc = r.structuredContent as { rolled_back: boolean };
+    expect(sc.rolled_back).toBe(true);
+
+    // fresh.md should be restored
+    const fresh = await readFile(join(vault, "fresh.md"), "utf-8");
+    expect(fresh).toBe("untracked");
+    await expect(stat(join(vault, "blocker/moved.md"))).rejects.toThrow();
+  });
+
+  it("dry_run returns the plan without writing or committing", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "a.md", "[[b]]");
+    await writeNote(vault, "b.md", "leaf");
+    const sg = simpleGit(vault);
+    await sg.add(["-A"]);
+    await sg.commit("init");
+
+    const r = await callTool(client, "bulk_move", {
+      operations: [{ from: "b.md", to: "renamed.md" }],
+      dry_run: true,
+    });
+    const sc = r.structuredContent as {
+      success: boolean;
+      total_link_updates: number;
+      dry_run: boolean;
+    };
+    expect(sc.success).toBe(true);
+    expect(sc.dry_run).toBe(true);
+    expect(sc.total_link_updates).toBe(1);
+    await expect(stat(join(vault, "b.md"))).resolves.toBeDefined();
+    await expect(stat(join(vault, "renamed.md"))).rejects.toThrow();
+    const log = await simpleGit(vault).log();
+    expect(log.total).toBe(1);
+  });
+
+  it("returns a single snapshot commit; does not auto-followup", async () => {
+    await initGitInVault(vault);
+    await writeNote(vault, "a.md", "");
+    const sg = simpleGit(vault);
+    await sg.add(["-A"]);
+    await sg.commit("init");
+    // Make state dirty so the snapshot will actually commit:
+    await writeNote(vault, "extra.md", "");
+
+    const r = await callTool(client, "bulk_move", {
+      operations: [{ from: "a.md", to: "renamed.md" }],
+    });
+    const sc = r.structuredContent as { snapshot_sha?: string };
+    expect(sc.snapshot_sha).toBeDefined();
+    const log = await simpleGit(vault).log();
+    expect(log.total).toBe(2); // init + snapshot, no auto-followup
+  });
+
+  it("unsafe_no_snapshot=true works without git", async () => {
+    await writeNote(vault, "a.md", "[[b]]");
+    await writeNote(vault, "b.md", "leaf");
+    const r = await callTool(client, "bulk_move", {
+      operations: [{ from: "b.md", to: "renamed.md" }],
+      unsafe_no_snapshot: true,
+    });
+    const sc = r.structuredContent as { success: boolean };
+    expect(sc.success).toBe(true);
+    const a = await readFile(join(vault, "a.md"), "utf-8");
+    expect(a).toBe("[[renamed]]");
+  });
+});

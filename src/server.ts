@@ -13,6 +13,7 @@ import { registerFindBacklinks } from "./tools/find_backlinks.js";
 import { registerMove } from "./tools/move.js";
 import { registerGitStatus } from "./tools/git_status.js";
 import { registerGitCommit } from "./tools/git_commit.js";
+import { registerBulkMove } from "./tools/bulk_move.js";
 
 export function createServer(vaultPath: string): McpServer {
   const server = new McpServer({
@@ -35,6 +36,7 @@ export function createServer(vaultPath: string): McpServer {
   registerMove(server, vaultPath);
   registerGitStatus(server, vaultPath, git);
   registerGitCommit(server, vaultPath, git);
+  registerBulkMove(server, vaultPath, git);
 
   return server;
 }

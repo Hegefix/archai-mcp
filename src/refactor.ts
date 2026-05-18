@@ -45,6 +45,20 @@ export function recomputeOutgoingMarkdownLinks(
   });
 }
 
+export function recomputeMovedFileLinks(
+  content: string,
+  oldNotePath: string,
+  newNotePath: string,
+  pathMap: Map<string, string>
+): { content: string; updates: LinkUpdate[] } {
+  return rewriteMarkdownLinks(content, (url) => {
+    const resolved = resolveMarkdownLinkUrl(oldNotePath, url);
+    if (resolved === null) return null;
+    const newTarget = pathMap.get(resolved) ?? resolved;
+    return relativeFromTo(newNotePath, newTarget);
+  });
+}
+
 export function rewriteMarkdownLinksByPathMap(
   content: string,
   notePath: string,
