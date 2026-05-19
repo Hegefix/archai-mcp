@@ -59,6 +59,7 @@ These keep the vault internally consistent when notes are renamed, moved, or reo
 | `move` | Move/rename a single note. Rewrites wikilinks across the vault when the basename changes, recomputes markdown-style relative links, bumps the moved note's `updated`. `dry_run`, `overwrite`, `allow_ambiguity` flags. |
 | `bulk_move` | Atomic batch of moves with `git reset --hard` rollback on failure. Topologically orders chained moves (A→B, B→C). Rejects cycles, duplicate destinations, and git-ignored sources. |
 | `rewrite_links` | Mass-rename a wikilink target without moving any files. Use when a note was renamed outside this server (e.g. in Obsidian's UI) and references broke. |
+| `lint_links` | Vault-wide audit of broken wikilinks. Classifies each as `title_form`, `typo`, or `phantom` with suggested fixes. Read-only. |
 
 Git inspection and push are intentionally NOT exposed as tools — use your terminal. `bulk_move` uses git internally for its snapshot/rollback safety net.
 
@@ -113,6 +114,58 @@ If the vault isn't a git repo and the default snapshot path is used, the tool er
 #### Required for `bulk_move`
 
 A `git` binary on `PATH` and a git repo at the vault root (`git init` if needed), unless you pass `unsafe_no_snapshot: true`.
+
+### Linting
+
+`lint_links` walks the vault, finds every wikilink that doesn't resolve to a file, and classifies it. Use this periodically to clean up the graph or after a bulk import. Read-only — apply suggested fixes via `rewrite_links` after review.
+
+| Classification | Meaning |
+|---|---|
+| `title_form` | Broken target is a human-readable title for an existing note (e.g. `[[How the Internet Works — HTTP, HTML, Protocols]]` when the file is `how-the-internet-works-http-html-protocols.md`). High confidence rewrite. |
+| `typo` | Broken target is a close edit-distance match to an existing basename. Confidence depends on similarity. |
+| `phantom` | No plausible candidate. Either the note needs to be created or the link removed — needs user decision. |
+
+```jsonc
+// Request
+{ "scope": "public", "ignore_intentional": true }
+```
+
+```jsonc
+// structuredContent (truncated)
+{
+  "scanned_files": 27,
+  "total_wikilinks": 89,
+  "broken_count": 3,
+  "broken_links": [
+    {
+      "target": "How the Internet Works — HTTP, HTML, Protocols",
+      "occurrences": [
+        { "path": "public/notes/web-basics.md", "line": 14, "column": 3, "raw": "[[How the Internet Works — HTTP, HTML, Protocols]]", "context": "...see [[How the Internet Works — HTTP, HTML, Protocols]] for the deep dive..." }
+      ],
+      "classification": "title_form",
+      "candidates": [
+        { "basename": "how-the-internet-works-http-html-protocols", "path": "public/tech/how-the-internet-works-http-html-protocols.md", "similarity": 1.0, "reason": "title_match" }
+      ],
+      "suggested_fix": { "action": "rewrite_to", "target_basename": "how-the-internet-works-http-html-protocols", "confidence": "high" }
+    }
+  ],
+  "summary": {
+    "by_classification": { "title_form": 1, "typo": 1, "phantom": 1 },
+    "high_confidence_fixes": 2,
+    "needs_user_decision": 1
+  }
+}
+```
+
+#### Intentional placeholders
+
+To mark a wikilink as a deliberate stub (e.g. for future content), append `<!-- intentional -->` on the same line:
+
+```markdown
+- [[future-concept]] <!-- intentional --> — to be written after the deep dive
+```
+
+These are skipped by default (`ignore_intentional: true`). Pass `ignore_intentional: false` to surface them.
 
 ## Frontmatter
 
