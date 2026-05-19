@@ -49,3 +49,16 @@ export function getAllMarkdownFiles(vaultPath: string): Promise<string[]> {
     posix: true,
   });
 }
+
+export function getAllAttachmentFiles(
+  vaultPath: string,
+  extensions: readonly string[]
+): Promise<string[]> {
+  return glob(`**/*.{${extensions.join(",")}}`, {
+    cwd: vaultPath,
+    ignore: [".obsidian/**"],
+    nodir: true,
+    posix: true,
+    nocase: true,
+  });
+}

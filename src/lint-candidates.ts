@@ -13,7 +13,11 @@ export interface Candidate {
   reason: CandidateReason;
 }
 
-export type Classification = "title_form" | "typo" | "phantom";
+export type Classification =
+  | "title_form"
+  | "typo"
+  | "phantom"
+  | "attachment_missing";
 
 export interface SuggestedFix {
   action: "rewrite_to" | "no_clear_match";

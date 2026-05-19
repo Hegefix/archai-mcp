@@ -33,6 +33,12 @@ async function writeNote(vault: string, relPath: string, body: string): Promise<
   await writeFile(full, body, "utf-8");
 }
 
+async function writeAttachment(vault: string, relPath: string): Promise<void> {
+  const full = join(vault, relPath);
+  await mkdir(join(full, ".."), { recursive: true });
+  await writeFile(full, Buffer.alloc(0));
+}
+
 interface LintStructured {
   scanned_files: number;
   total_wikilinks: number;
@@ -46,7 +52,7 @@ interface LintStructured {
       raw: string;
       context: string;
     }>;
-    classification: "title_form" | "typo" | "phantom";
+    classification: "title_form" | "typo" | "phantom" | "attachment_missing";
     candidates: Array<{
       basename: string;
       path: string;
@@ -60,7 +66,12 @@ interface LintStructured {
     };
   }>;
   summary: {
-    by_classification: { title_form: number; typo: number; phantom: number };
+    by_classification: {
+      title_form: number;
+      typo: number;
+      phantom: number;
+      attachment_missing: number;
+    };
     high_confidence_fixes: number;
     needs_user_decision: number;
   };
@@ -240,5 +251,165 @@ describe("lint_links", () => {
     const out = await lint(client);
     expect(out.summary.high_confidence_fixes).toBeGreaterThanOrEqual(1);
     expect(out.summary.needs_user_decision).toBeGreaterThanOrEqual(1);
+  });
+});
+
+describe("lint_links — scope and code-block isolation", () => {
+  let vault: string;
+  let client: Client;
+  let close: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ vault, client, close } = await setupVault());
+  });
+
+  afterEach(async () => {
+    await close();
+  });
+
+  it("scope_basename_resolution_full_vault: links resolve to files outside scope", async () => {
+    await writeNote(vault, "a/foo.md", "Link: [[bar]] here.\n");
+    await writeNote(vault, "b/bar.md", "Target.\n");
+    const out = await lint(client, { scope: "a" });
+    expect(out.broken_count).toBe(0);
+    expect(out.total_wikilinks).toBe(1);
+    expect(out.scanned_files).toBe(1);
+  });
+
+  it("wikilink_in_fenced_code_block_ignored", async () => {
+    await writeNote(vault, "real.md", "Real target.\n");
+    await writeNote(
+      vault,
+      "note.md",
+      [
+        "Real link: [[real]]",
+        "",
+        "```",
+        "Example: [[fake-in-block]]",
+        "```",
+        "",
+      ].join("\n")
+    );
+    const out = await lint(client);
+    expect(out.total_wikilinks).toBe(1);
+    expect(out.broken_count).toBe(0);
+  });
+
+  it("wikilink_in_inline_code_ignored", async () => {
+    await writeNote(vault, "real.md", "Real target.\n");
+    await writeNote(
+      vault,
+      "note.md",
+      "Inline `[[fake-inline]]` and [[real]] link.\n"
+    );
+    const out = await lint(client);
+    expect(out.total_wikilinks).toBe(1);
+    expect(out.broken_count).toBe(0);
+  });
+
+  it("text_output_includes_broken_targets", async () => {
+    await writeNote(vault, "note.md", "Broken: [[missing-thing]].\n");
+    const res = await client.callTool({
+      name: "lint_links",
+      arguments: {},
+    });
+    const content = res.content as Array<{ type: string; text: string }>;
+    const text = content[0]!.text;
+    expect(text).toContain("[[missing-thing]]");
+    expect(text).toContain("note.md:1");
+  });
+});
+
+describe("lint_links — attachment wikilinks", () => {
+  let vault: string;
+  let client: Client;
+  let close: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ vault, client, close } = await setupVault());
+  });
+
+  afterEach(async () => {
+    await close();
+  });
+
+  it("attachment_link_existing_file_path_form", async () => {
+    await writeAttachment(vault, "_attachments/doc.pdf");
+    await writeNote(vault, "note.md", "See [[_attachments/doc.pdf]] for details.\n");
+    const out = await lint(client);
+    expect(out.total_wikilinks).toBe(1);
+    expect(out.broken_count).toBe(0);
+  });
+
+  it("attachment_link_existing_file_basename_form", async () => {
+    await writeAttachment(vault, "_attachments/image.png");
+    await writeNote(vault, "note.md", "Embed: [[image.png]] here.\n");
+    const out = await lint(client);
+    expect(out.total_wikilinks).toBe(1);
+    expect(out.broken_count).toBe(0);
+  });
+
+  it("attachment_link_missing_file", async () => {
+    await writeNote(vault, "note.md", "Missing: [[_attachments/ghost.pdf]].\n");
+    const out = await lint(client);
+    expect(out.broken_count).toBe(1);
+    const broken = out.broken_links[0]!;
+    expect(broken.target).toBe("_attachments/ghost.pdf");
+    expect(broken.classification).toBe("attachment_missing");
+    expect(broken.suggested_fix.action).toBe("no_clear_match");
+    expect(broken.suggested_fix.confidence).toBe("low");
+    expect(broken.candidates).toEqual([]);
+    expect(out.summary.by_classification.attachment_missing).toBe(1);
+  });
+
+  it("mixed_attachment_and_note_links", async () => {
+    await writeAttachment(vault, "_attachments/real.pdf");
+    await writeNote(vault, "real-note.md", "Real.\n");
+    await writeNote(
+      vault,
+      "index.md",
+      [
+        "PDF: [[_attachments/real.pdf]]",
+        "Note: [[real-note]]",
+        "Missing PDF: [[_attachments/ghost.pdf]]",
+        "Missing note: [[ghost-note]]",
+        "",
+      ].join("\n")
+    );
+    const out = await lint(client);
+    expect(out.total_wikilinks).toBe(4);
+    expect(out.broken_count).toBe(2);
+    expect(out.summary.by_classification.attachment_missing).toBe(1);
+    expect(out.summary.by_classification.phantom).toBe(1);
+    expect(out.summary.by_classification.title_form).toBe(0);
+    expect(out.summary.by_classification.typo).toBe(0);
+
+    const byTarget = new Map(out.broken_links.map((b) => [b.target, b]));
+    expect(byTarget.get("_attachments/ghost.pdf")?.classification).toBe(
+      "attachment_missing"
+    );
+    expect(byTarget.get("ghost-note")?.classification).toBe("phantom");
+  });
+
+  it("non_attachment_extension_treated_as_note", async () => {
+    await writeNote(vault, "note.md", "Weird: [[foo.bar]] link.\n");
+    const out = await lint(client);
+    expect(out.broken_count).toBe(1);
+    const broken = out.broken_links[0]!;
+    expect(broken.classification).toBe("phantom");
+    expect(out.summary.by_classification.attachment_missing).toBe(0);
+    expect(out.summary.by_classification.phantom).toBe(1);
+  });
+
+  it("text_output_marks_attachment_missing", async () => {
+    await writeNote(vault, "note.md", "Missing: [[_attachments/ghost.pdf]].\n");
+    const res = await client.callTool({
+      name: "lint_links",
+      arguments: {},
+    });
+    const content = res.content as Array<{ type: string; text: string }>;
+    const text = content[0]!.text;
+    expect(text).toContain("[[_attachments/ghost.pdf]] [attachment]");
+    expect(text).toContain("(attachment_missing)");
   });
 });
