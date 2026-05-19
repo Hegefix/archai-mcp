@@ -12,6 +12,7 @@ import { registerFindBacklinks } from "./tools/find_backlinks.js";
 import { registerMove } from "./tools/move.js";
 import { registerBulkMove } from "./tools/bulk_move.js";
 import { registerRewriteLinks } from "./tools/rewrite_links.js";
+import { registerLintLinks } from "./tools/lint_links.js";
 
 export function createServer(vaultPath: string): McpServer {
   const server = new McpServer({
@@ -32,6 +33,7 @@ export function createServer(vaultPath: string): McpServer {
   registerMove(server, vaultPath);
   registerBulkMove(server, vaultPath);
   registerRewriteLinks(server, vaultPath);
+  registerLintLinks(server, vaultPath);
 
   return server;
 }
