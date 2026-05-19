@@ -4,6 +4,7 @@ import { registerRead } from "./tools/read.js";
 import { registerSearch } from "./tools/search.js";
 import { registerList } from "./tools/list.js";
 import { registerUpdate } from "./tools/update.js";
+import { registerSetStatus } from "./tools/set_status.js";
 import { registerDelete } from "./tools/delete.js";
 import { registerCreateFolder } from "./tools/create_folder.js";
 import { registerDeleteFolder } from "./tools/delete_folder.js";
@@ -25,6 +26,7 @@ export function createServer(vaultPath: string): McpServer {
   registerSearch(server, vaultPath);
   registerList(server, vaultPath);
   registerUpdate(server, vaultPath);
+  registerSetStatus(server, vaultPath);
   registerDelete(server, vaultPath);
   registerCreateFolder(server, vaultPath);
   registerDeleteFolder(server, vaultPath);
