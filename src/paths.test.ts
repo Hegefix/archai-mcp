@@ -2,8 +2,6 @@ import { describe, it, expect } from "vitest";
 import {
   normalizeVaultPath,
   resolveVaultPath,
-  relativeFromTo,
-  vaultBasename,
 } from "./paths.js";
 
 describe("normalizeVaultPath", () => {
@@ -77,45 +75,5 @@ describe("resolveVaultPath", () => {
     expect(resolveVaultPath("/vault", "public\\tech\\note.md")).toBe(
       "/vault/public/tech/note.md"
     );
-  });
-});
-
-describe("relativeFromTo", () => {
-  it("returns sibling filename", () => {
-    expect(relativeFromTo("a/b/c.md", "a/b/d.md")).toBe("d.md");
-  });
-
-  it("ascends to common ancestor", () => {
-    expect(relativeFromTo("a/b/c.md", "a/x/d.md")).toBe("../x/d.md");
-  });
-
-  it("descends into subfolder when source is at vault root", () => {
-    expect(relativeFromTo("a.md", "sub/b.md")).toBe("sub/b.md");
-  });
-
-  it("ascends across multiple levels", () => {
-    expect(relativeFromTo("a/b/c/d.md", "e.md")).toBe("../../../e.md");
-  });
-
-  it("normalizes inputs before computing", () => {
-    expect(relativeFromTo("./a/b/c.md", "a/./d.md")).toBe("../d.md");
-  });
-});
-
-describe("vaultBasename", () => {
-  it("strips .md extension", () => {
-    expect(vaultBasename("public/tech/note.md")).toBe("note");
-  });
-
-  it("returns basename for path at vault root", () => {
-    expect(vaultBasename("note.md")).toBe("note");
-  });
-
-  it("preserves the filename when no .md extension", () => {
-    expect(vaultBasename("foo/bar")).toBe("bar");
-  });
-
-  it("handles dotted filenames", () => {
-    expect(vaultBasename("foo/bar.draft.md")).toBe("bar.draft");
   });
 });

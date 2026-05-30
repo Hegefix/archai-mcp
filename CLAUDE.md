@@ -26,9 +26,13 @@ Set `ARCHAI_PATH` in the inspector's environment configuration.
 
 ## Architecture
 
-- Single source file: `src/index.ts`
+- `src/server.ts` — creates the MCP server, registers all tools
+- `src/index.ts` — entry point, stdio transport, exports
+- `src/paths.ts` — vault path normalization, traversal protection, file discovery
+- `src/text.ts` — kebab-case conversion, folder inference, search helpers
+- `src/tools/` — one file per tool
 - Stdio transport — designed to be launched by an MCP client (Claude Code, Cursor, etc.)
 - Filesystem-backed — all operations read/write markdown files directly in the vault
 - `gray-matter` for frontmatter parsing/serialization
 - `glob` for file discovery
-- Nine tools: `save`, `read`, `search`, `list`, `update`, `delete`, `create_folder`, `delete_folder`, `list_folders`
+- Six tools: `save`, `read`, `search`, `list`, `update`, `create_folder`

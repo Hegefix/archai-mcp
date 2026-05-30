@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { mkdtemp, rm, writeFile, readFile, mkdir, stat } from "node:fs/promises";
+import { mkdtemp, rm, readFile, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import matter from "gray-matter";
@@ -172,6 +172,16 @@ describe("MCP tools", () => {
       expect(getText(result)).toContain("private/personal");
     });
 
+    it("rejects titles with Cyrillic characters", async () => {
+      const result = await callTool("save", {
+        title: "Заметка о React",
+        content: "Some content",
+        folder: "public/tech",
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Cyrillic");
+    });
+
     it("warns about duplicates when force is not set", async () => {
       await callTool("save", {
         title: "Duplicate Test",
@@ -334,30 +344,6 @@ describe("MCP tools", () => {
     });
   });
 
-  describe("delete", () => {
-    it("deletes an existing note", async () => {
-      await callTool("save", {
-        title: "To Delete",
-        content: "Gone soon",
-        folder: "public/tech",
-        force: true,
-      });
-      const result = await callTool("delete", {
-        path: "public/tech/to-delete.md",
-      });
-      expect(getText(result)).toContain("Deleted:");
-
-      await expect(
-        readFile(join(vaultPath, "public/tech/to-delete.md"), "utf-8")
-      ).rejects.toThrow();
-    });
-
-    it("returns error for missing file", async () => {
-      const result = await callTool("delete", { path: "nope.md" });
-      expect(result.isError).toBe(true);
-    });
-  });
-
   describe("create_folder", () => {
     it("creates a folder with parents and reports created:true", async () => {
       const result = await callTool("create_folder", {
@@ -383,13 +369,6 @@ describe("MCP tools", () => {
       expect(second.isError).toBeFalsy();
     });
 
-    it("errors when target path collides with an existing file", async () => {
-      await writeFile(join(vaultPath, "afile.md"), "hi", "utf-8");
-      const result = await callTool("create_folder", { path: "afile.md" });
-      expect(result.isError).toBe(true);
-      expect(getText(result)).toContain("exists and is a file");
-    });
-
     it("rejects absolute paths", async () => {
       const result = await callTool("create_folder", { path: "/etc/foo" });
       expect(result.isError).toBe(true);
@@ -412,80 +391,6 @@ describe("MCP tools", () => {
       });
       const stats = await stat(join(vaultPath, "a/c"));
       expect(stats.isDirectory()).toBe(true);
-    });
-  });
-
-  describe("delete_folder", () => {
-    it("deletes an empty folder", async () => {
-      await mkdir(join(vaultPath, "empty"), { recursive: true });
-      const result = await callTool("delete_folder", { path: "empty" });
-      expect(getText(result)).toContain("Deleted folder:");
-      await expect(stat(join(vaultPath, "empty"))).rejects.toThrow();
-    });
-
-    it("refuses to delete non-empty folder without force", async () => {
-      await mkdir(join(vaultPath, "full"), { recursive: true });
-      await writeFile(join(vaultPath, "full/note.md"), "hi", "utf-8");
-      const result = await callTool("delete_folder", { path: "full" });
-      expect(getText(result)).toContain("not empty");
-
-      const stats = await stat(join(vaultPath, "full"));
-      expect(stats.isDirectory()).toBe(true);
-    });
-
-    it("deletes non-empty folder with force", async () => {
-      await mkdir(join(vaultPath, "full"), { recursive: true });
-      await writeFile(join(vaultPath, "full/note.md"), "hi", "utf-8");
-      const result = await callTool("delete_folder", {
-        path: "full",
-        force: true,
-      });
-      expect(getText(result)).toContain("Deleted folder:");
-      await expect(stat(join(vaultPath, "full"))).rejects.toThrow();
-    });
-
-    it("returns error for missing folder", async () => {
-      const result = await callTool("delete_folder", { path: "nope" });
-      expect(result.isError).toBe(true);
-    });
-
-    it("returns error when path is a file", async () => {
-      await writeFile(join(vaultPath, "file.txt"), "hi", "utf-8");
-      const result = await callTool("delete_folder", { path: "file.txt" });
-      expect(result.isError).toBe(true);
-      expect(getText(result)).toContain("is not a folder");
-    });
-  });
-
-  describe("list_folders", () => {
-    beforeEach(async () => {
-      await mkdir(join(vaultPath, "public/tech"), { recursive: true });
-      await mkdir(join(vaultPath, "private"), { recursive: true });
-      await mkdir(join(vaultPath, ".obsidian"), { recursive: true });
-    });
-
-    it("lists root folders excluding .obsidian", async () => {
-      const result = await callTool("list_folders", {});
-      const text = getText(result);
-      expect(text).toContain("public");
-      expect(text).toContain("private");
-      expect(text).not.toContain(".obsidian");
-    });
-
-    it("lists subfolders under a parent", async () => {
-      const result = await callTool("list_folders", { path: "public" });
-      const text = getText(result);
-      expect(text).toContain("public/tech");
-    });
-
-    it("returns empty for folder with no subfolders", async () => {
-      const result = await callTool("list_folders", { path: "private" });
-      expect(getText(result)).toBe("No subfolders found.");
-    });
-
-    it("returns error for missing folder", async () => {
-      const result = await callTool("list_folders", { path: "nope" });
-      expect(result.isError).toBe(true);
     });
   });
 });

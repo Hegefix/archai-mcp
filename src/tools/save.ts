@@ -5,14 +5,15 @@ import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { resolveVaultPath, getAllMarkdownFiles } from "../paths.js";
 import { toKebabCase, todayISO, inferFolder, extractBestSnippet } from "../text.js";
-import { normalizeWikilinks } from "../wikilink-normalize.js";
+
+const CYRILLIC_RE = /[Ѐ-ӿ]/;
 
 export function registerSave(server: McpServer, vaultPath: string): void {
   server.registerTool(
     "save",
     {
       description:
-        "Create a new note in the Obsidian vault. Searches for duplicates first — returns matches instead of creating if similar notes exist. Use force=true to skip duplicate check. Wikilinks in the body are normalized to kebab-case basenames before writing (e.g. [[Pretty Title]] → [[pretty-title]]); set normalize_wikilinks=false to preserve raw input verbatim (only needed when authoring docs that show anti-pattern examples).",
+        "Create a new note in the Obsidian vault. Searches for duplicates first — returns matches instead of creating if similar notes exist. Use force=true to skip duplicate check. Rejects titles containing Cyrillic characters.",
       inputSchema: {
         title: z.string().describe("Note title"),
         content: z.string().describe("Markdown content of the note"),
@@ -28,15 +29,21 @@ export function registerSave(server: McpServer, vaultPath: string): void {
           .boolean()
           .optional()
           .describe("Skip duplicate check and create regardless"),
-        normalize_wikilinks: z
-          .boolean()
-          .optional()
-          .describe(
-            "Normalize wikilinks in the body to kebab-case basenames. Default true. Set false to preserve raw input (e.g. docs showing anti-patterns)."
-          ),
       },
     },
-    async ({ title, content, folder, tags, force, normalize_wikilinks }) => {
+    async ({ title, content, folder, tags, force }) => {
+      if (CYRILLIC_RE.test(title)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: title contains Cyrillic characters. Use Latin transliteration instead.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
       if (!force) {
         const files = await getAllMarkdownFiles(vaultPath);
         const titleWords = title
@@ -83,13 +90,7 @@ export function registerSave(server: McpServer, vaultPath: string): void {
         }
       }
 
-      const shouldNormalize = normalize_wikilinks !== false;
-      const { content: bodyContent, changes: normalizationChanges } =
-        shouldNormalize
-          ? normalizeWikilinks(content)
-          : { content, changes: [] };
-
-      const targetFolder = folder ?? inferFolder(bodyContent);
+      const targetFolder = folder ?? inferFolder(content);
       const filename = toKebabCase(title) + ".md";
       const relativePath = join(targetFolder, filename);
       const fullPath = resolveVaultPath(vaultPath, relativePath);
@@ -105,27 +106,14 @@ export function registerSave(server: McpServer, vaultPath: string): void {
         frontmatter["tags"] = tags;
       }
 
-      const fileContent = matter.stringify(bodyContent, frontmatter);
+      const fileContent = matter.stringify(content, frontmatter);
 
       await mkdir(dirname(fullPath), { recursive: true });
       await writeFile(fullPath, fileContent, "utf-8");
 
-      const lines: string[] = [`Created: ${relativePath}`];
-      if (normalizationChanges.length > 0) {
-        lines.push(
-          `Normalized ${normalizationChanges.length} wikilink${normalizationChanges.length === 1 ? "" : "s"}:`
-        );
-        for (const c of normalizationChanges) {
-          lines.push(`  ${c.from} → ${c.to}`);
-        }
-      }
-
       return {
-        content: [{ type: "text" as const, text: lines.join("\n") }],
-        structuredContent: {
-          path: relativePath,
-          normalized_wikilinks: normalizationChanges,
-        },
+        content: [{ type: "text" as const, text: `Created: ${relativePath}` }],
+        structuredContent: { path: relativePath },
       };
     }
   );
