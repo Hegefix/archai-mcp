@@ -4,16 +4,17 @@ import matter from "gray-matter";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { resolveVaultPath, getAllMarkdownFiles } from "../paths.js";
+import { type VaultRegistry, resolveVault } from "../vaults.js";
 import { toKebabCase, todayISO, inferFolder, extractBestSnippet } from "../text.js";
 
 const CYRILLIC_RE = /[Ѐ-ӿ]/;
 
-export function registerSave(server: McpServer, vaultPath: string): void {
+export function registerSave(server: McpServer, registry: VaultRegistry): void {
   server.registerTool(
     "save",
     {
       description:
-        "Create a new note in the Obsidian vault. Searches for duplicates first — returns matches instead of creating if similar notes exist. Use force=true to skip duplicate check. Rejects titles containing Cyrillic characters.",
+        "Create a new note in an Obsidian vault. Searches for duplicates first — returns matches instead of creating if similar notes exist. Use force=true to skip duplicate check. Rejects titles containing Cyrillic characters.",
       inputSchema: {
         title: z.string().describe("Note title"),
         content: z.string().describe("Markdown content of the note"),
@@ -29,9 +30,24 @@ export function registerSave(server: McpServer, vaultPath: string): void {
           .boolean()
           .optional()
           .describe("Skip duplicate check and create regardless"),
+        vault: z
+          .string()
+          .optional()
+          .describe("Vault name (defaults to the primary vault)"),
       },
     },
-    async ({ title, content, folder, tags, force }) => {
+    async ({ title, content, folder, tags, force, vault }) => {
+      let vaultPath: string;
+      try {
+        vaultPath = resolveVault(registry, vault);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+
       if (CYRILLIC_RE.test(title)) {
         return {
           content: [
@@ -111,9 +127,10 @@ export function registerSave(server: McpServer, vaultPath: string): void {
       await mkdir(dirname(fullPath), { recursive: true });
       await writeFile(fullPath, fileContent, "utf-8");
 
+      const vaultName = vault ?? registry.defaultName;
       return {
-        content: [{ type: "text" as const, text: `Created: ${relativePath}` }],
-        structuredContent: { path: relativePath },
+        content: [{ type: "text" as const, text: `Created: [${vaultName}] ${relativePath}` }],
+        structuredContent: { path: relativePath, vault: vaultName },
       };
     }
   );

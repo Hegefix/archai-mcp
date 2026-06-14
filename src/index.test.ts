@@ -128,7 +128,7 @@ describe("MCP tools", () => {
         folder: "public/tech",
         force: true,
       });
-      expect(getText(result)).toContain("Created: public/tech/test-note.md");
+      expect(getText(result)).toContain("Created: [default] public/tech/test-note.md");
 
       const filePath = join(vaultPath, "public/tech/test-note.md");
       const raw = await readFile(filePath, "utf-8");
@@ -391,6 +391,151 @@ describe("MCP tools", () => {
       });
       const stats = await stat(join(vaultPath, "a/c"));
       expect(stats.isDirectory()).toBe(true);
+    });
+  });
+});
+
+// --- Multi-vault integration tests ---
+
+describe("multi-vault", () => {
+  let personalPath: string;
+  let workPath: string;
+  let client: Client;
+
+  async function callTool(name: string, args: Record<string, unknown> = {}) {
+    return client.callTool({ name, arguments: args });
+  }
+
+  beforeEach(async () => {
+    personalPath = await mkdtemp(join(tmpdir(), "archai-personal-"));
+    workPath = await mkdtemp(join(tmpdir(), "archai-work-"));
+    const registry = {
+      vaults: new Map([
+        ["personal", personalPath],
+        ["work", workPath],
+      ]),
+      defaultName: "personal",
+    };
+    const server = createServer(registry);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    client = new Client({ name: "test-client", version: "1.0.0" });
+    await client.connect(clientTransport);
+  });
+
+  afterEach(async () => {
+    await client.close();
+    await rm(personalPath, { recursive: true, force: true });
+    await rm(workPath, { recursive: true, force: true });
+  });
+
+  it("list_vaults returns both names and marks the default", async () => {
+    const result = await callTool("list_vaults", {});
+    expect(result.structuredContent).toEqual({
+      vaults: [
+        { name: "personal", path: personalPath, default: true },
+        { name: "work", path: workPath, default: false },
+      ],
+    });
+  });
+
+  it("save writes into the named non-default vault", async () => {
+    await callTool("save", {
+      title: "Work Note",
+      content: "work content",
+      folder: "public/tech",
+      vault: "work",
+      force: true,
+    });
+    const raw = await readFile(
+      join(workPath, "public/tech/work-note.md"),
+      "utf-8"
+    );
+    expect(matter(raw).data["title"]).toBe("Work Note");
+  });
+
+  it("save defaults to the primary vault", async () => {
+    const result = await callTool("save", {
+      title: "Default Note",
+      content: "x",
+      folder: "public/tech",
+      force: true,
+    });
+    expect(getText(result)).toContain("[personal]");
+    const stats = await stat(
+      join(personalPath, "public/tech/default-note.md")
+    );
+    expect(stats.isFile()).toBe(true);
+  });
+
+  it("read hits the correct vault", async () => {
+    await callTool("save", {
+      title: "Work Doc",
+      content: "secret work content",
+      folder: "public/tech",
+      vault: "work",
+      force: true,
+    });
+    const result = await callTool("read", {
+      path: "public/tech/work-doc.md",
+      vault: "work",
+    });
+    expect(getText(result)).toContain("secret work content");
+  });
+
+  it("returns an error for an unknown vault", async () => {
+    const result = await callTool("read", {
+      path: "whatever.md",
+      vault: "nonexistent",
+    });
+    expect(result.isError).toBe(true);
+    expect(getText(result)).toContain("not found");
+  });
+
+  describe("with notes in both vaults", () => {
+    beforeEach(async () => {
+      await callTool("save", {
+        title: "React Guide",
+        content: "react native architecture",
+        folder: "public/tech",
+        vault: "personal",
+        force: true,
+      });
+      await callTool("save", {
+        title: "React Sprint",
+        content: "react work sprint planning",
+        folder: "public/tech",
+        vault: "work",
+        force: true,
+      });
+    });
+
+    it("search spans all vaults by default, labeled", async () => {
+      const result = await callTool("search", { query: "react" });
+      const text = getText(result);
+      expect(text).toContain("[personal]");
+      expect(text).toContain("[work]");
+    });
+
+    it("search scopes to a single vault when given", async () => {
+      const result = await callTool("search", { query: "react", vault: "work" });
+      const text = getText(result);
+      expect(text).toContain("[work]");
+      expect(text).not.toContain("[personal]");
+    });
+
+    it("list spans all vaults by default, labeled", async () => {
+      const result = await callTool("list", {});
+      const text = getText(result);
+      expect(text).toContain("[personal]");
+      expect(text).toContain("[work]");
+    });
+
+    it("list scopes to a single vault when given", async () => {
+      const result = await callTool("list", { vault: "personal" });
+      const text = getText(result);
+      expect(text).toContain("[personal]");
+      expect(text).not.toContain("[work]");
     });
   });
 });

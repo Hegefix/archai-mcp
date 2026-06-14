@@ -11,29 +11,50 @@ npm run build
 
 ## Usage
 
-Set the `ARCHAI_PATH` environment variable to the root of your Obsidian vault, then run the server:
+Copy `vaults_example.json` to `vaults.json` in the project root and edit it:
 
 ```bash
-ARCHAI_PATH=/path/to/vault node dist/index.js
+cp vaults_example.json vaults.json
+```
+
+```json
+{
+  "default": "tech",
+  "vaults": {
+    "tech": "../archai/tech",
+    "warhammer40k": "../archai/warhammer40k"
+  }
+}
+```
+
+Vault paths may be absolute, `~`-prefixed, or relative to `vaults.json`. `default` is optional and falls back to the first listed vault. `vaults.json` is gitignored (it holds local paths); `vaults_example.json` is the committed template.
+
+```bash
+node dist/index.js
 ```
 
 ### Claude Code
 
-Add to `~/.claude/settings.json`:
+Add to `~/.claude/settings.json` — no env vars needed, the server reads `vaults.json` from its own directory:
 
 ```json
 {
   "mcpServers": {
     "archai": {
       "command": "node",
-      "args": ["/absolute/path/to/archai-mcp/dist/index.js"],
-      "env": {
-        "ARCHAI_PATH": "/path/to/vault"
-      }
+      "args": ["/absolute/path/to/archai-mcp/dist/index.js"]
     }
   }
 }
 ```
+
+## Vaults
+
+The server can serve multiple vaults from one instance. Every tool accepts an optional `vault` argument:
+
+- `save`, `read`, `update`, `create_folder` — default to the **primary** vault (first in `ARCHAI_VAULTS`).
+- `search`, `list` — span **all** vaults when no `vault` is given; results are labeled `[vaultname]`. Pass `vault` to scope to one.
+- `list_vaults` — discover the configured vault names (use these as `vault` values).
 
 ## Tools
 
@@ -41,10 +62,11 @@ Add to `~/.claude/settings.json`:
 |------|-------------|
 | `save` | Create a note with frontmatter. Rejects Cyrillic titles. Checks for duplicates first — use `force: true` to skip. |
 | `read` | Read the full content of a note by path. |
-| `search` | Search notes by filename and content. Returns top 10 with snippets. |
-| `list` | List notes, optionally filtered by folder. Sorted by creation date. |
+| `search` | Search notes by filename and content across all vaults. Returns top 10 with snippets. |
+| `list` | List notes across all vaults, optionally filtered by folder. Sorted by creation date. |
 | `update` | Replace note body, preserve frontmatter, bump `updated` date. |
 | `create_folder` | Create a folder (and any parent folders). |
+| `list_vaults` | List configured vaults and their roots. |
 
 ## Frontmatter
 

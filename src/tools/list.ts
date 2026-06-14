@@ -3,51 +3,87 @@ import { z } from "zod/v3";
 import matter from "gray-matter";
 import { readFile } from "node:fs/promises";
 import { resolveVaultPath, getAllMarkdownFiles } from "../paths.js";
+import { type VaultRegistry, resolveVault } from "../vaults.js";
 
-export function registerList(server: McpServer, vaultPath: string): void {
+type ListEntry = {
+  vault: string;
+  path: string;
+  title: string;
+  status: string;
+  created: string;
+};
+
+async function listVault(
+  vaultName: string,
+  vaultPath: string,
+  folder?: string
+): Promise<ListEntry[]> {
+  const files = await getAllMarkdownFiles(vaultPath);
+  const filtered = folder ? files.filter((f) => f.startsWith(folder)) : files;
+
+  const entries: ListEntry[] = [];
+  for (const filePath of filtered) {
+    const fullPath = resolveVaultPath(vaultPath, filePath);
+    const fileContent = await readFile(fullPath, "utf-8");
+    const parsed = matter(fileContent);
+
+    entries.push({
+      vault: vaultName,
+      path: filePath,
+      title:
+        (parsed.data["title"] as string | undefined) ??
+        filePath.replace(/\.md$/, ""),
+      status: String(parsed.data["status"] ?? "unknown"),
+      created:
+        parsed.data["created"] instanceof Date
+          ? (parsed.data["created"].toISOString().split("T")[0] as string)
+          : String(parsed.data["created"] ?? "unknown"),
+    });
+  }
+  return entries;
+}
+
+export function registerList(server: McpServer, registry: VaultRegistry): void {
   server.registerTool(
     "list",
     {
       description:
-        "List all notes in the vault, optionally filtered by folder. Returns paths, titles, status, and creation dates sorted by date descending.",
+        "List notes, optionally filtered by folder. Lists all vaults unless a vault is given. Returns paths, titles, status, and creation dates sorted by date descending, labeled by vault.",
       inputSchema: {
         folder: z
           .string()
           .optional()
-          .describe(
-            'Filter by folder prefix, e.g. "public/tech" or "private"'
-          ),
+          .describe('Filter by folder prefix, e.g. "public/tech" or "private"'),
+        vault: z
+          .string()
+          .optional()
+          .describe("Vault name to scope the listing (defaults to all vaults)"),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ folder }) => {
-      const files = await getAllMarkdownFiles(vaultPath);
-      const filtered = folder
-        ? files.filter((f) => f.startsWith(folder))
-        : files;
+    async ({ folder, vault }) => {
+      const targets: Array<[string, string]> = [];
+      if (vault === undefined) {
+        for (const [name, vaultPath] of registry.vaults) {
+          targets.push([name, vaultPath]);
+        }
+      } else {
+        let vaultPath: string;
+        try {
+          vaultPath = resolveVault(registry, vault);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text" as const, text: `Error: ${msg}` }],
+            isError: true,
+          };
+        }
+        targets.push([vault, vaultPath]);
+      }
 
-      const entries: Array<{
-        path: string;
-        title: string;
-        status: string;
-        created: string;
-      }> = [];
-
-      for (const filePath of filtered) {
-        const fullPath = resolveVaultPath(vaultPath, filePath);
-        const fileContent = await readFile(fullPath, "utf-8");
-        const parsed = matter(fileContent);
-
-        entries.push({
-          path: filePath,
-          title:
-            (parsed.data["title"] as string | undefined) ??
-            filePath.replace(/\.md$/, ""),
-          status: String(parsed.data["status"] ?? "unknown"),
-          created: parsed.data["created"] instanceof Date
-            ? parsed.data["created"].toISOString().split("T")[0] as string
-            : String(parsed.data["created"] ?? "unknown"),
-        });
+      const entries: ListEntry[] = [];
+      for (const [name, vaultPath] of targets) {
+        entries.push(...(await listVault(name, vaultPath, folder)));
       }
 
       entries.sort((a, b) => {
@@ -58,16 +94,14 @@ export function registerList(server: McpServer, vaultPath: string): void {
 
       if (entries.length === 0) {
         return {
-          content: [
-            { type: "text" as const, text: "No notes found." },
-          ],
+          content: [{ type: "text" as const, text: "No notes found." }],
         };
       }
 
       const formatted = entries
         .map(
           (e) =>
-            `- **${e.title}** (${e.status})\n  Path: ${e.path} | Created: ${e.created}`
+            `- **${e.title}** (${e.status}) [${e.vault}]\n  Path: ${e.path} | Created: ${e.created}`
         )
         .join("\n");
 

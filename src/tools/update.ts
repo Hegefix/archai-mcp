@@ -3,9 +3,10 @@ import { z } from "zod/v3";
 import matter from "gray-matter";
 import { readFile, writeFile } from "node:fs/promises";
 import { resolveVaultPath } from "../paths.js";
+import { type VaultRegistry, resolveVault } from "../vaults.js";
 import { todayISO } from "../text.js";
 
-export function registerUpdate(server: McpServer, vaultPath: string): void {
+export function registerUpdate(server: McpServer, registry: VaultRegistry): void {
   server.registerTool(
     "update",
     {
@@ -20,9 +21,23 @@ export function registerUpdate(server: McpServer, vaultPath: string): void {
           .describe(
             "New markdown content (replaces existing body, frontmatter is preserved)"
           ),
+        vault: z
+          .string()
+          .optional()
+          .describe("Vault name (defaults to the primary vault)"),
       },
     },
-    async ({ path: notePath, content: newContent }) => {
+    async ({ path: notePath, content: newContent, vault }) => {
+      let vaultPath: string;
+      try {
+        vaultPath = resolveVault(registry, vault);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
       const fullPath = resolveVaultPath(vaultPath, notePath);
       let existing: string;
       try {
