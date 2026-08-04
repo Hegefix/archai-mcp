@@ -11,10 +11,24 @@ export function todayISO(): string {
   return new Date().toISOString().split("T")[0] as string;
 }
 
-export function inferFolder(content: string): string {
-  const personalKeywords =
-    /\b(personal|career|life|journal|diary|health|finance|family|relationship|goal|habit)\b/i;
-  return personalKeywords.test(content) ? "private/personal" : "public/tech";
+export type VaultFolderInfo = {
+  name: string;
+  topLevelFolders: string[];
+};
+
+/** Human-readable summary of each vault's real top-level folders, for tool description text. */
+export function describeVaultLayouts(vaults: VaultFolderInfo[]): string {
+  return vaults
+    .map((v) =>
+      v.topLevelFolders.length > 0
+        ? `${v.name}: ${v.topLevelFolders.join(", ")}`
+        : `${v.name}: flat, no subfolders`
+    )
+    .join("; ");
+}
+
+export function firstTopLevelFolder(vault: VaultFolderInfo | undefined): string | undefined {
+  return vault?.topLevelFolders[0];
 }
 
 export function findWordPositions(content: string, words: string[]): Map<string, number[]> {

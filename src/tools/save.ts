@@ -3,13 +3,28 @@ import { z } from "zod/v3";
 import matter from "gray-matter";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { resolveVaultPath, getAllMarkdownFiles } from "../paths.js";
+import { resolveVaultPath, getAllMarkdownFiles, assertKnownTopLevelFolder } from "../paths.js";
 import { type VaultRegistry, resolveVault } from "../vaults.js";
-import { toKebabCase, todayISO, inferFolder, extractBestSnippet } from "../text.js";
+import {
+  toKebabCase,
+  todayISO,
+  extractBestSnippet,
+  describeVaultLayouts,
+  firstTopLevelFolder,
+  type VaultFolderInfo,
+} from "../text.js";
 
 const CYRILLIC_RE = /[Ѐ-ӿ]/;
 
-export function registerSave(server: McpServer, registry: VaultRegistry): void {
+export function registerSave(
+  server: McpServer,
+  registry: VaultRegistry,
+  vaultFolders: VaultFolderInfo[]
+): void {
+  const defaultVault = vaultFolders.find((v) => v.name === registry.defaultName);
+  const layoutSummary = describeVaultLayouts(vaultFolders);
+  const folderExample = firstTopLevelFolder(defaultVault) ?? "(vault root — omit folder)";
+
   server.registerTool(
     "save",
     {
@@ -21,7 +36,9 @@ export function registerSave(server: McpServer, registry: VaultRegistry): void {
         folder: z
           .string()
           .optional()
-          .describe('Target folder relative to vault root, e.g. "public/tech"'),
+          .describe(
+            `Target folder relative to vault root, e.g. "${folderExample}". Omit to save at the vault root. Known top-level folders — ${layoutSummary}. The first path segment must match an existing top-level folder unless allowNewTopLevel is set.`
+          ),
         tags: z
           .array(z.string())
           .optional()
@@ -30,13 +47,19 @@ export function registerSave(server: McpServer, registry: VaultRegistry): void {
           .boolean()
           .optional()
           .describe("Skip duplicate check and create regardless"),
+        allowNewTopLevel: z
+          .boolean()
+          .optional()
+          .describe(
+            "Allow creating the note under a top-level folder that doesn't exist yet in the vault. Without this, an unrecognized top-level folder is rejected."
+          ),
         vault: z
           .string()
           .optional()
           .describe("Vault name (defaults to the primary vault)"),
       },
     },
-    async ({ title, content, folder, tags, force, vault }) => {
+    async ({ title, content, folder, tags, force, allowNewTopLevel, vault }) => {
       let vaultPath: string;
       try {
         vaultPath = resolveVault(registry, vault);
@@ -106,7 +129,21 @@ export function registerSave(server: McpServer, registry: VaultRegistry): void {
         }
       }
 
-      const targetFolder = folder ?? inferFolder(content);
+      const targetFolder = folder ?? ".";
+      const vaultName = vault ?? registry.defaultName;
+
+      if (!allowNewTopLevel) {
+        try {
+          await assertKnownTopLevelFolder(vaultPath, vaultName, targetFolder);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return {
+            content: [{ type: "text" as const, text: `Error: ${msg}` }],
+            isError: true,
+          };
+        }
+      }
+
       const filename = toKebabCase(title) + ".md";
       const relativePath = join(targetFolder, filename);
       const fullPath = resolveVaultPath(vaultPath, relativePath);
@@ -127,7 +164,6 @@ export function registerSave(server: McpServer, registry: VaultRegistry): void {
       await mkdir(dirname(fullPath), { recursive: true });
       await writeFile(fullPath, fileContent, "utf-8");
 
-      const vaultName = vault ?? registry.defaultName;
       return {
         content: [{ type: "text" as const, text: `Created: [${vaultName}] ${relativePath}` }],
         structuredContent: { path: relativePath, vault: vaultName },

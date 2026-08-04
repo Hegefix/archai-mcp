@@ -8,7 +8,8 @@ import matter from "gray-matter";
 import {
   createServer,
   toKebabCase,
-  inferFolder,
+  describeVaultLayouts,
+  firstTopLevelFolder,
   findWordPositions,
   extractBestSnippet,
   resolveVaultPath,
@@ -39,17 +40,27 @@ describe("toKebabCase", () => {
   });
 });
 
-describe("inferFolder", () => {
-  it("returns private/personal for personal content", () => {
-    expect(inferFolder("My career goals for 2025")).toBe("private/personal");
+describe("describeVaultLayouts", () => {
+  it("summarizes folders per vault", () => {
+    expect(
+      describeVaultLayouts([
+        { name: "tech", topLevelFolders: ["concepts", "patterns", "projects"] },
+        { name: "work", topLevelFolders: [] },
+      ])
+    ).toBe("tech: concepts, patterns, projects; work: flat, no subfolders");
+  });
+});
+
+describe("firstTopLevelFolder", () => {
+  it("returns the first folder when present", () => {
+    expect(
+      firstTopLevelFolder({ name: "tech", topLevelFolders: ["concepts", "patterns"] })
+    ).toBe("concepts");
   });
 
-  it("returns public/tech for technical content", () => {
-    expect(inferFolder("React hooks patterns")).toBe("public/tech");
-  });
-
-  it("defaults to public/tech for neutral content", () => {
-    expect(inferFolder("Some random note")).toBe("public/tech");
+  it("returns undefined for a flat vault or a missing vault", () => {
+    expect(firstTopLevelFolder({ name: "work", topLevelFolders: [] })).toBeUndefined();
+    expect(firstTopLevelFolder(undefined)).toBeUndefined();
   });
 });
 
@@ -108,7 +119,7 @@ describe("MCP tools", () => {
 
   beforeEach(async () => {
     vaultPath = await mkdtemp(join(tmpdir(), "archai-test-"));
-    const server = createServer(vaultPath);
+    const server = await createServer(vaultPath);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
     client = new Client({ name: "test-client", version: "1.0.0" });
@@ -125,12 +136,13 @@ describe("MCP tools", () => {
       const result = await callTool("save", {
         title: "Test Note",
         content: "Hello world",
-        folder: "public/tech",
+        folder: "notes",
+        allowNewTopLevel: true,
         force: true,
       });
-      expect(getText(result)).toContain("Created: [default] public/tech/test-note.md");
+      expect(getText(result)).toContain("Created: [default] notes/test-note.md");
 
-      const filePath = join(vaultPath, "public/tech/test-note.md");
+      const filePath = join(vaultPath, "notes/test-note.md");
       const raw = await readFile(filePath, "utf-8");
       const parsed = matter(raw);
       expect(parsed.data["title"]).toBe("Test Note");
@@ -142,41 +154,57 @@ describe("MCP tools", () => {
       await callTool("save", {
         title: "Tagged Note",
         content: "Content",
-        folder: "public/tech",
+        folder: "notes",
+        allowNewTopLevel: true,
         tags: ["ts", "mcp"],
         force: true,
       });
-      const raw = await readFile(
-        join(vaultPath, "public/tech/tagged-note.md"),
-        "utf-8"
-      );
+      const raw = await readFile(join(vaultPath, "notes/tagged-note.md"), "utf-8");
       const parsed = matter(raw);
       expect(parsed.data["tags"]).toEqual(["ts", "mcp"]);
     });
 
-    it("infers public/tech for technical content", async () => {
+    it("defaults to the vault root when folder is omitted", async () => {
       const result = await callTool("save", {
-        title: "React Hooks",
-        content: "useState patterns",
+        title: "Root Note",
+        content: "x",
         force: true,
       });
-      expect(getText(result)).toContain("public/tech");
+      expect(getText(result)).toContain("Created: [default] root-note.md");
+      const stats = await stat(join(vaultPath, "root-note.md"));
+      expect(stats.isFile()).toBe(true);
     });
 
-    it("infers private/personal for personal content", async () => {
+    it("rejects an unknown top-level folder without allowNewTopLevel", async () => {
+      await callTool("create_folder", { path: "concepts", allowNewTopLevel: true });
       const result = await callTool("save", {
-        title: "My Goals",
-        content: "career growth and personal development goals",
+        title: "Misplaced Note",
+        content: "x",
+        folder: "public/tech",
         force: true,
       });
-      expect(getText(result)).toContain("private/personal");
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain('Unknown top-level folder "public"');
+      expect(getText(result)).toContain("concepts");
+    });
+
+    it("allows nesting under an existing top-level folder without allowNewTopLevel", async () => {
+      await callTool("create_folder", { path: "concepts", allowNewTopLevel: true });
+      const result = await callTool("save", {
+        title: "Nested Note",
+        content: "x",
+        folder: "concepts/react",
+        force: true,
+      });
+      expect(result.isError).toBeFalsy();
+      const stats = await stat(join(vaultPath, "concepts/react/nested-note.md"));
+      expect(stats.isFile()).toBe(true);
     });
 
     it("rejects titles with Cyrillic characters", async () => {
       const result = await callTool("save", {
         title: "Заметка о React",
         content: "Some content",
-        folder: "public/tech",
       });
       expect(result.isError).toBe(true);
       expect(getText(result)).toContain("Cyrillic");
@@ -186,13 +214,11 @@ describe("MCP tools", () => {
       await callTool("save", {
         title: "Duplicate Test",
         content: "Original note",
-        folder: "public/tech",
         force: true,
       });
       const result = await callTool("save", {
         title: "Duplicate Test",
         content: "Another note",
-        folder: "public/tech",
       });
       expect(getText(result)).toContain("potentially similar");
     });
@@ -203,11 +229,12 @@ describe("MCP tools", () => {
       await callTool("save", {
         title: "Read Me",
         content: "File content here",
-        folder: "public/tech",
+        folder: "notes",
+        allowNewTopLevel: true,
         force: true,
       });
       const result = await callTool("read", {
-        path: "public/tech/read-me.md",
+        path: "notes/read-me.md",
       });
       expect(getText(result)).toContain("File content here");
     });
@@ -226,19 +253,21 @@ describe("MCP tools", () => {
       await callTool("save", {
         title: "React Native Guide",
         content: "A guide to react native architecture",
-        folder: "public/tech",
+        folder: "notes",
+        allowNewTopLevel: true,
         force: true,
       });
       await callTool("save", {
         title: "TypeScript Tips",
         content: "Advanced typescript patterns for react apps",
-        folder: "public/tech",
+        folder: "notes",
         force: true,
       });
       await callTool("save", {
         title: "Cooking Pasta",
         content: "Boil water and add pasta",
-        folder: "private/personal",
+        folder: "journal",
+        allowNewTopLevel: true,
         force: true,
       });
     });
@@ -277,13 +306,15 @@ describe("MCP tools", () => {
       await callTool("save", {
         title: "Note A",
         content: "First",
-        folder: "public/tech",
+        folder: "notes",
+        allowNewTopLevel: true,
         force: true,
       });
       await callTool("save", {
         title: "Note B",
         content: "Second",
-        folder: "private/personal",
+        folder: "journal",
+        allowNewTopLevel: true,
         force: true,
       });
     });
@@ -296,7 +327,7 @@ describe("MCP tools", () => {
     });
 
     it("filters by folder", async () => {
-      const result = await callTool("list", { folder: "public" });
+      const result = await callTool("list", { folder: "notes" });
       const text = getText(result);
       expect(text).toContain("Note A");
       expect(text).not.toContain("Note B");
@@ -313,22 +344,20 @@ describe("MCP tools", () => {
       await callTool("save", {
         title: "Updatable",
         content: "Original content",
-        folder: "public/tech",
+        folder: "notes",
+        allowNewTopLevel: true,
         force: true,
       });
     });
 
     it("replaces content and bumps updated date", async () => {
       const result = await callTool("update", {
-        path: "public/tech/updatable.md",
+        path: "notes/updatable.md",
         content: "New content",
       });
       expect(getText(result)).toContain("Updated:");
 
-      const raw = await readFile(
-        join(vaultPath, "public/tech/updatable.md"),
-        "utf-8"
-      );
+      const raw = await readFile(join(vaultPath, "notes/updatable.md"), "utf-8");
       const parsed = matter(raw);
       expect(parsed.content.trim()).toBe("New content");
       expect(parsed.data["title"]).toBe("Updatable");
@@ -348,6 +377,7 @@ describe("MCP tools", () => {
     it("creates a folder with parents and reports created:true", async () => {
       const result = await callTool("create_folder", {
         path: "a/b/c",
+        allowNewTopLevel: true,
       });
       expect(getText(result)).toContain("Created folder: a/b/c");
       expect(result.structuredContent).toEqual({
@@ -360,7 +390,10 @@ describe("MCP tools", () => {
     });
 
     it("is idempotent and reports created:false on the second call", async () => {
-      const first = await callTool("create_folder", { path: "x" });
+      const first = await callTool("create_folder", {
+        path: "x",
+        allowNewTopLevel: true,
+      });
       expect(first.structuredContent).toEqual({ created: true, path: "x" });
 
       const second = await callTool("create_folder", { path: "x" });
@@ -384,6 +417,7 @@ describe("MCP tools", () => {
     it("normalizes paths with redundant segments", async () => {
       const result = await callTool("create_folder", {
         path: "./a/./b/../c",
+        allowNewTopLevel: true,
       });
       expect(result.structuredContent).toEqual({
         created: true,
@@ -391,6 +425,28 @@ describe("MCP tools", () => {
       });
       const stats = await stat(join(vaultPath, "a/c"));
       expect(stats.isDirectory()).toBe(true);
+    });
+
+    it("rejects a new top-level folder without allowNewTopLevel, listing valid ones", async () => {
+      await callTool("create_folder", { path: "concepts", allowNewTopLevel: true });
+      const result = await callTool("create_folder", { path: "public" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain('Unknown top-level folder "public"');
+      expect(getText(result)).toContain("concepts");
+    });
+
+    it("allows nesting under an existing top-level folder without allowNewTopLevel", async () => {
+      await callTool("create_folder", { path: "concepts", allowNewTopLevel: true });
+      const result = await callTool("create_folder", { path: "concepts/react" });
+      expect(result.isError).toBeFalsy();
+      const stats = await stat(join(vaultPath, "concepts/react"));
+      expect(stats.isDirectory()).toBe(true);
+    });
+
+    it("reports a flat-vault message when no top-level folders exist yet", async () => {
+      const result = await callTool("create_folder", { path: "concepts" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("no subfolders yet");
     });
   });
 });
@@ -416,7 +472,7 @@ describe("multi-vault", () => {
       ]),
       defaultName: "personal",
     };
-    const server = createServer(registry);
+    const server = await createServer(registry);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     await server.connect(serverTransport);
     client = new Client({ name: "test-client", version: "1.0.0" });
@@ -443,14 +499,10 @@ describe("multi-vault", () => {
     await callTool("save", {
       title: "Work Note",
       content: "work content",
-      folder: "public/tech",
       vault: "work",
       force: true,
     });
-    const raw = await readFile(
-      join(workPath, "public/tech/work-note.md"),
-      "utf-8"
-    );
+    const raw = await readFile(join(workPath, "work-note.md"), "utf-8");
     expect(matter(raw).data["title"]).toBe("Work Note");
   });
 
@@ -458,13 +510,10 @@ describe("multi-vault", () => {
     const result = await callTool("save", {
       title: "Default Note",
       content: "x",
-      folder: "public/tech",
       force: true,
     });
     expect(getText(result)).toContain("[personal]");
-    const stats = await stat(
-      join(personalPath, "public/tech/default-note.md")
-    );
+    const stats = await stat(join(personalPath, "default-note.md"));
     expect(stats.isFile()).toBe(true);
   });
 
@@ -472,12 +521,11 @@ describe("multi-vault", () => {
     await callTool("save", {
       title: "Work Doc",
       content: "secret work content",
-      folder: "public/tech",
       vault: "work",
       force: true,
     });
     const result = await callTool("read", {
-      path: "public/tech/work-doc.md",
+      path: "work-doc.md",
       vault: "work",
     });
     expect(getText(result)).toContain("secret work content");
@@ -497,14 +545,12 @@ describe("multi-vault", () => {
       await callTool("save", {
         title: "React Guide",
         content: "react native architecture",
-        folder: "public/tech",
         vault: "personal",
         force: true,
       });
       await callTool("save", {
         title: "React Sprint",
         content: "react work sprint planning",
-        folder: "public/tech",
         vault: "work",
         force: true,
       });

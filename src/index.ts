@@ -4,10 +4,11 @@ import { createServer } from "./server.js";
 import { loadVaultConfig } from "./vaults.js";
 
 export { createServer } from "./server.js";
-export { resolveVaultPath } from "./paths.js";
+export { resolveVaultPath, listTopLevelFolders, assertKnownTopLevelFolder } from "./paths.js";
 export {
   toKebabCase,
-  inferFolder,
+  describeVaultLayouts,
+  firstTopLevelFolder,
   findWordPositions,
   extractBestSnippet,
 } from "./text.js";
@@ -26,7 +27,7 @@ async function main(): Promise<void> {
     );
     process.exit(1);
   }
-  const server = createServer(registry);
+  const server = await createServer(registry);
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

@@ -4,6 +4,7 @@ import matter from "gray-matter";
 import { readFile } from "node:fs/promises";
 import { resolveVaultPath, getAllMarkdownFiles } from "../paths.js";
 import { type VaultRegistry, resolveVault } from "../vaults.js";
+import { describeVaultLayouts, firstTopLevelFolder, type VaultFolderInfo } from "../text.js";
 
 type ListEntry = {
   vault: string;
@@ -43,7 +44,15 @@ async function listVault(
   return entries;
 }
 
-export function registerList(server: McpServer, registry: VaultRegistry): void {
+export function registerList(
+  server: McpServer,
+  registry: VaultRegistry,
+  vaultFolders: VaultFolderInfo[]
+): void {
+  const defaultVault = vaultFolders.find((v) => v.name === registry.defaultName);
+  const layoutSummary = describeVaultLayouts(vaultFolders);
+  const folderExample = firstTopLevelFolder(defaultVault) ?? "(this vault is flat — omit folder)";
+
   server.registerTool(
     "list",
     {
@@ -53,7 +62,9 @@ export function registerList(server: McpServer, registry: VaultRegistry): void {
         folder: z
           .string()
           .optional()
-          .describe('Filter by folder prefix, e.g. "public/tech" or "private"'),
+          .describe(
+            `Filter by folder prefix, e.g. "${folderExample}". Known top-level folders — ${layoutSummary}.`
+          ),
         vault: z
           .string()
           .optional()
