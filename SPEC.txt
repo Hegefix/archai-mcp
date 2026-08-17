@@ -1,0 +1,647 @@
+archai-mcp — SPECIFICATION
+==========================
+
+Version: 1.0.0
+Server name (MCP): "archai-mcp"
+Transport: stdio only
+Runtime: Node.js, ESM ("type": "module"), TypeScript compiled to dist/
+Dependencies: @modelcontextprotocol/sdk ^1.29.0, glob ^13, gray-matter ^4
+External: the `git` CLI must be on PATH for write history (see §7). There is no
+git library dependency; the server shells out via child_process.
+State: none. No database, no cache, no index. Every call reads/writes the
+filesystem directly, and history is read back out of git rather than tracked
+in-process.
+
+
+1. PURPOSE
+----------
+
+An MCP server that gives a client read/write access to one or more Obsidian
+vaults (plain directories of markdown files) on the local filesystem. It
+exposes 8 tools, in registration order: save, save_reference, read, search,
+list, update, create_folder, list_vaults.
+
+Notes are markdown files with YAML frontmatter. Frontmatter is parsed and
+written with gray-matter. References (see §6.2) are raw files stored verbatim
+with no frontmatter at all.
+
+Every successful write is versioned: it is committed to the vault's git repo
+and appended to the vault's log.md by one shared post-write hook (§7). Nothing
+else in the server commits or logs.
+
+
+2. CONFIGURATION
+----------------
+
+The server reads a JSON file `vaults.json` located in the project root,
+resolved as `../vaults.json` relative to the compiled `dist/index.js`
+(i.e. new URL("../vaults.json", import.meta.url)). There are no environment
+variables and no CLI arguments.
+
+Config shape:
+
+    {
+      "default": "tech",
+      "vaults": {
+        "tech": "../archai/tech",
+        "warhammer40k": "/absolute/path/to/vault",
+        "work": "~/Documents/work-vault"
+      }
+    }
+
+Rules:
+  - `vaults` is required: a non-empty object mapping vault name -> path.
+  - Each path may be absolute, `~`-prefixed (expanded to the user home
+    directory), or relative (resolved against the directory containing
+    vaults.json). Paths are trimmed.
+  - `default` is optional. If present it must name a key in `vaults`.
+    If absent, the first key in `vaults` (insertion order) becomes the default.
+  - Vault roots are NOT required to exist at startup; a missing root simply
+    reports zero top-level folders.
+
+Config load errors (all fatal — the process logs to stderr and exits 1):
+  - "Cannot read vault config at <path>"
+  - "Invalid JSON in vault config <path>: <parser message>"
+  - "Vault config must be a JSON object with a \"vaults\" map"
+  - "Vault config \"vaults\" must be an object mapping names to paths"
+  - "Vault \"<name>\" must have a non-empty path"
+  - "Vault config \"vaults\" is empty"
+  - "Default vault \"<name>\" is not listed in \"vaults\""
+On failure the message is followed by:
+  "Create vaults.json in the archai-mcp root (copy vaults_example.json)."
+
+`vaults_example.json` is the committed template; `vaults.json` is gitignored.
+
+Embedding: `createServer(input)` accepts either a VaultRegistry or a bare path
+string. A bare string is normalized into a single vault named "default".
+
+
+3. INTERNAL MODEL
+-----------------
+
+VaultRegistry = { vaults: Map<name, absolutePath>, defaultName: string }
+
+resolveVault(registry, name?) -> absolute path
+  - name undefined => registry.defaultName
+  - unknown name => throws: `vault "<name>" not found. Available: a, b, c`
+    (tools catch this and return it as an isError text result)
+
+At startup, `createServer` stats every vault root once and builds
+VaultFolderInfo[] = [{ name, topLevelFolders: string[] }]. This snapshot is
+injected into the *description text* of the save, read, list and create_folder
+schemas so the tool docs show the client the real folder names of the real
+vaults instead of hardcoded examples. The snapshot is taken once at startup and
+is NOT refreshed; runtime validation re-reads the filesystem each time.
+
+
+4. PATH SAFETY (applies to every tool that touches a path)
+----------------------------------------------------------
+
+All caller-supplied paths are relative to the vault root and pass through
+normalizeVaultPath -> resolveVaultPath before any fs call.
+
+normalizeVaultPath(input):
+  - non-string          -> throws "Path must be a string"
+  - empty/whitespace    -> throws "Path is empty"
+  - backslashes are converted to forward slashes
+  - POSIX-absolute or Win32-absolute -> throws
+    "Path must be relative to vault root, got absolute: <input>"
+  - posix-normalized; if the result is ".." or starts with "../" -> throws
+    "Path traversal detected: <input>"
+  - a trailing "/" is stripped (except for ".")
+
+resolveVaultPath(vaultRoot, relPath) = join(vaultRoot, normalized), with a
+second `startsWith(vaultRoot)` guard that throws "Path traversal detected".
+
+Markdown discovery: getAllMarkdownFiles globs `**/*.md` with cwd = vault root,
+nodir, posix-style results, ignoring `.obsidian/**`.
+
+
+5. TOP-LEVEL FOLDER GUARD
+-------------------------
+
+listTopLevelFolders(vaultRoot) returns the real immediate subdirectories of the
+vault root, excluding `.obsidian`, sorted. A missing/unreadable root returns [].
+
+assertKnownTopLevelFolder(vaultRoot, vaultName, relPath):
+  - a path normalizing to "." (the vault root) is always allowed
+  - otherwise the FIRST path segment must be one of the real top-level folders
+  - on failure throws:
+      Unknown top-level folder "<seg>" in vault "<vault>". Existing top-level
+      folders: <a, b, c>. Pass allowNewTopLevel: true to create it.
+    (when the vault has no subdirectories the list reads
+     "(none — this vault has no subfolders yet)")
+
+Only the top-level segment is gated. Arbitrary nesting under an existing
+top-level folder is always permitted and intermediate directories are created
+as needed (e.g. `concepts/react/hooks` is fine once `concepts` exists).
+
+This guard is applied by `save` and `create_folder`, and is bypassed by passing
+`allowNewTopLevel: true`.
+
+
+6. TOOLS
+--------
+
+Common conventions:
+  - Every tool result is { content: [{type:"text", text}], isError?, structuredContent? }.
+  - Errors are returned as isError:true with text "Error: <message>" — they are
+    not thrown out of the tool handler.
+  - `vault` argument semantics differ by tool:
+      save, save_reference, read, update, create_folder
+                                         -> optional, defaults to the DEFAULT vault
+      search, list                       -> optional, defaults to ALL vaults
+  - Only `read`, `search`, `list` and `list_vaults` carry
+    annotations: { readOnlyHint: true }.
+  - Schemas are declared with zod/v3 shapes (the SDK's registerTool expects v3).
+  - save, save_reference and update each call the post-write hook (§7) exactly
+    once, after a successful write and before returning. create_folder does not
+    (it writes no content). The hook's outcome never changes the tool result.
+
+
+6.1 save
+--------
+Description: create a NEW note. Searches for duplicates first and returns the
+matches instead of writing when any are found. Rejects Cyrillic titles.
+
+Input:
+  title             string    required  Note title.
+  content           string    required  Markdown body.
+  folder            string    optional  Target folder relative to vault root.
+                                        Omitted => vault root.
+  tags              string[]  optional  Written to frontmatter.
+  sources           Source[]  optional  Provenance; written to frontmatter.
+                                        Source = { resource: string (required),
+                                        id?, title?, author?, last_modified? },
+                                        all strings. Deduped on resource+id.
+  force             boolean   optional  Skip the duplicate check.
+  allowNewTopLevel  boolean   optional  Permit an unknown top-level folder.
+  vault             string    optional  Defaults to the default vault.
+
+Order of operations (important — the checks short-circuit in this order):
+  1. resolveVault. Unknown vault -> isError.
+  2. Cyrillic check: if /[Ѐ-ӿ]/ matches the title -> isError
+     "Error: title contains Cyrillic characters. Use Latin transliteration instead."
+  3. Duplicate check, unless force === true:
+       - titleWords = title lowercased, split on whitespace, keeping words with
+         length > 2.
+       - Every markdown file in the vault is read (in glob order) until 5
+         matches accumulate.
+       - A file matches if any titleWord appears in its lowercased path
+         (filename match) OR in its lowercased content (content match).
+       - For each match a ~150-char snippet is extracted around the densest
+         cluster of query words (see §8).
+       - If matches.length > 0 the tool returns SUCCESS (not isError) with:
+             Found <n> potentially similar note(s):
+
+             - <path>
+               <snippet>
+             ...
+
+             Call save again with force=true to create anyway.
+         and NO file is written.
+       - Note: if every word in the title is <= 3 chars, titleWords is empty,
+         nothing matches, and the write proceeds.
+       - The scan is capped at 5 matches; it is not ranked.
+  4. Top-level folder guard on `folder` (default ".") unless
+     allowNewTopLevel === true. Failure -> isError.
+     (This runs AFTER the duplicate check, so a duplicate response can precede
+     a folder-validation error.)
+  5. Filename = toKebabCase(title) + ".md"  (lowercase; everything except
+     [a-z0-9\s-] stripped; whitespace -> "-"; runs of "-" collapsed; leading and
+     trailing "-" trimmed).
+  6. Frontmatter is generated:
+         title:   <title>
+         created: <YYYY-MM-DD, today, UTC>
+         updated: <same>
+         status:  seedling
+         tags:    [...]        (only when tags is non-empty)
+         sources: [...]        (only when sources is non-empty; entries are
+                                normalized — undefined/empty fields dropped,
+                                key order resource,id,title,author,last_modified
+                                — and deduped within the batch on resource+id)
+  7. Parent directories are created recursively; the file is written UTF-8 via
+     matter.stringify.
+  8. The post-write hook (§7) runs: log.md entry, then git commit
+     "save: <relativePath>".
+
+Output on write:
+  text: `Created: [<vaultName>] <relativePath>`
+  structuredContent: { path, vault }
+
+There is no content-based folder inference. A note goes to the vault root
+unless `folder` is given. An existing file at the target path is overwritten
+silently (the duplicate check is the only guard).
+
+
+6.2 save_reference
+------------------
+Description: store raw source material verbatim under `references/`. This is
+the counterpart to `save`: `save` is for authored notes, `save_reference` is
+for the material they were written from (specs, transcripts, dumps).
+
+Input:
+  path     string  required  Path relative to `references/`, extension included,
+                             e.g. "rfc/rfc-9110.txt". Stored at references/<path>.
+  content  string  required  Written byte-for-byte, exactly as given.
+  vault    string  optional  Defaults to the default vault.
+
+Deliberately absent, all three by design:
+  - No frontmatter generation. Content that happens to start with `---` is
+    stored as literal text, not parsed as YAML.
+  - No kebab-casing. The caller's path is used verbatim (after normalization).
+  - No duplicate check. `save`'s titleWords/snippet scan is title-driven and
+    there is no title here; raw material is also legitimately near-identical to
+    the notes written from it, so the check would fire on almost every call.
+
+Behaviour:
+  1. resolveVault; unknown vault -> isError.
+  2. Path resolution, reusing the §4 helpers with no reimplementation:
+       relative = normalizeVaultPath(posix.join("references",
+                                                normalizeVaultPath(path)))
+     Normalizing twice is deliberate: the inner call rejects absolute paths and
+     anything escaping the vault, the outer one catches a path that would climb
+     out of `references/` while still landing inside the vault
+     (e.g. "sub/../../notes/x"). The result must start with "references/";
+     a path resolving to the folder itself (e.g. ".") -> isError
+     "Reference path must name a file inside references/, got: <input>".
+  3. If the target already exists -> isError
+     "reference already exists at <path>. References are immutable — write it
+     under a different path instead." The existing file is not touched.
+  4. Parent directories created recursively; content written UTF-8 as-is.
+  5. Post-write hook (§7): log.md entry, then commit
+     "save_reference: references/<path>".
+
+Output: text `Stored: [<vaultName>] <relativePath>`
+        structuredContent: { path, vault }
+
+Top-level folder guard: `references/` is created on demand and
+assertKnownTopLevelFolder is NOT called. The guard exists to stop a
+model-supplied top-level segment from inventing folders; here the segment is a
+constant owned by the tool, not caller input. Note there is no allowlist to
+extend — §5's list is derived from the filesystem on each call — so once the
+first reference is written, `references` appears in every other tool's folder
+list automatically.
+
+IMMUTABILITY is structural, not conventional: there is no update_reference
+tool, and save_reference refuses to overwrite. Together those leave no edit
+path in the tool surface at all — the same pattern as the deliberate absence of
+delete and move. Correcting a reference means storing a new one under a new
+path; the superseded copy stays in git history either way.
+
+
+6.3 read
+--------
+Description: read the full content of a note (frontmatter included, verbatim).
+
+Input:
+  path   string  required  Relative path to the note, e.g. "concepts/foo.md".
+  vault  string  optional  Defaults to the default vault.
+
+Output: the raw file content as text.
+Errors: unknown vault -> isError; unreadable/missing file -> isError
+        "Error: file not found at <path>".
+Note: path-normalization failures (absolute path, traversal) throw out of the
+handler rather than returning isError, and surface as an MCP tool error.
+
+
+6.4 update
+----------
+Description: replace the body of an existing note, preserving frontmatter and
+bumping `updated`.
+
+Input:
+  path     string    required  Relative path to the note.
+  content  string    required  New markdown body (replaces the existing body).
+  sources  Source[]  optional  Provenance to ADD (see §6.1 for the shape).
+                               Merged into the note's existing sources.
+  vault    string    optional  Defaults to the default vault.
+
+Behaviour:
+  - The file must already exist; missing -> isError "Error: file not found at <path>".
+  - Existing frontmatter is parsed and reused as-is; only `updated` is set to
+    today's date (YYYY-MM-DD, UTC). No other field is added or removed — a note
+    with no frontmatter gains a block containing just `updated`.
+  - `sources` is the one exception to "reused as-is", and only when the caller
+    passes a non-empty array: incoming entries are MERGED into the existing
+    list rather than replacing it, because provenance accumulates over a note's
+    life. Merge key is `resource` + `id` (NUL-separated, so "a b"+no-id cannot
+    collide with "a"+id "b"); an entry without an id is the resource itself and
+    is distinct from any of its items. On a key match the incoming fields are
+    shallow-merged OVER the stored entry, in place, keeping its position — so a
+    refreshed `last_modified` or a newly known `author` lands without
+    duplicating the entry. Omitting `sources` leaves the stored list untouched.
+    An existing `sources` value that isn't usable source data is dropped rather
+    than throwing; a single object (not a list) is treated as a one-entry list.
+  - The file is rewritten in full via matter.stringify.
+  - Post-write hook (§7): log.md entry, then commit "update: <path>".
+
+Output: text `Updated: <path>`; structuredContent { path }.
+There is no top-level folder guard and no append mode.
+
+
+6.5 search
+----------
+Description: full-text search across filename and content. Searches ALL vaults
+unless `vault` is given.
+
+Input:
+  query  string  required
+  vault  string  optional  Scope to one vault; default is every configured vault.
+
+Algorithm (per file, over all `**/*.md` excluding `.obsidian/**`):
+  - words = query lowercased, split on whitespace, non-empty. Empty query =>
+    "No results found."
+  - A file is a hit only if EVERY word appears in either the lowercased path or
+    the lowercased content (AND semantics, substring matching, no stemming).
+  - Score = (number of words found in the path) * 10 + proximityScore.
+    proximityScore is computed only when zero words matched the path: with >= 2
+    word occurrences in the content it is 1 / (1 + span), where span is the
+    character distance between the first and last occurrence. Otherwise 0.
+    (Caveat: occurrence positions are found against the raw content while the
+    "present" test is case-insensitive, so proximity only registers for
+    case-matching occurrences.)
+  - Title = frontmatter `title`, else the path with the `.md` suffix removed.
+  - Results from all target vaults are pooled, sorted by score descending, and
+    truncated to the top 10.
+
+Output text, per hit:
+    **<title>** [<vault>]
+    Path: <path>
+    Snippet: <snippet>
+blocks joined by a blank line.
+structuredContent: { results: [{ vault, path, title }] }  (top 10 only)
+No matches -> "No results found." (not an error).
+
+
+6.6 list
+--------
+Description: list notes with metadata. Lists ALL vaults unless `vault` is given.
+
+Input:
+  folder  string  optional  Filter by folder prefix.
+  vault   string  optional  Scope to one vault; default is every vault.
+
+Behaviour:
+  - Enumerates `**/*.md` per target vault; `folder` filters by raw
+    String.startsWith on the posix relative path — it is a string prefix, not a
+    path-segment match ("con" matches "concepts/x.md").
+  - Every matching file is read and its frontmatter parsed:
+      title   <- frontmatter.title, else path minus ".md"
+      status  <- frontmatter.status, else "unknown"
+      created <- frontmatter.created (a YAML Date is rendered as YYYY-MM-DD),
+                 else "unknown"
+  - Sorted by `created` descending (lexicographic on the ISO string); entries
+    with "unknown" are pushed toward the end.
+
+Output text, one line pair per note:
+    - **<title>** (<status>) [<vault>]
+      Path: <path> | Created: <created>
+Empty result -> "No notes found."
+No structuredContent.
+
+
+6.7 create_folder
+-----------------
+Description: create a folder and any parents. Idempotent.
+
+Input:
+  path              string   required  Folder path relative to vault root.
+  allowNewTopLevel  boolean  optional  Permit an unknown top-level folder.
+  vault             string   optional  Defaults to the default vault.
+
+Behaviour:
+  1. resolveVault; unknown vault -> isError.
+  2. normalizeVaultPath; invalid/absolute/traversing path -> isError.
+  3. stat the target:
+       - existing directory -> success, text "Already exists: <path>",
+         structuredContent { created: false, path }
+       - existing regular file -> isError
+         "Error: <path> exists and is a file, not a folder"
+       - does not exist -> continue
+  4. Unless allowNewTopLevel, assertKnownTopLevelFolder; failure -> isError.
+  5. mkdir recursive.
+Output on creation: text "Created folder: <path>",
+structuredContent { created: true, path }.
+
+
+6.8 list_vaults
+---------------
+Description: list the configured vaults and their filesystem roots. Takes no
+input.
+
+Output text: one line per vault,
+    - <name>[ (default)]: <absolute path>
+structuredContent: { vaults: [{ name, path, default: boolean }] }
+
+Use the returned names as the `vault` argument on the other tools.
+
+
+7. POST-WRITE HOOK (git history + log.md)
+-----------------------------------------
+
+One function, two side effects, called from exactly three places. `save`,
+`save_reference` and `update` each call it once after a successful write:
+
+    afterWrite({ tool, vaultName, vaultPath, path, title? }) -> string[]
+      tool  : "save" | "update" | "save_reference"
+      path  : vault-relative posix path just written
+      title : note title, used only in the log line
+
+Order is load-bearing: the log entry is appended FIRST, then the commit runs,
+so the log line and the note it describes land in the same commit.
+
+It never throws and never changes the tool result. Failures come back as
+warning strings and are printed to STDERR (stdout is the MCP transport). A
+write that succeeded stays succeeded even if bookkeeping fails.
+
+7.1 git
+-------
+Repo discovery (ensureRepo):
+  - `git -C <vault> rev-parse --show-toplevel` decides. Any repo already
+    governing the vault is reused — the vault's own `.git` OR an enclosing one,
+    which is the live setup: several vaults living inside one notes repo.
+  - `git init` runs ONLY when the vault is in no work tree at all. Existing
+    history is never re-rooted, rewritten, or nested into.
+
+Commit (commitVault), all run with cwd = vault root:
+  1. `git add -A -- .`
+  2. `git status --porcelain -- .`; empty output => nothing to commit, return
+     without a warning (a no-op write is a normal outcome, and `git commit`
+     exits non-zero on an empty commit).
+  3. `git commit -m "<tool>: <path>" -- .`
+     e.g. `save: concepts/react-hooks.md`, `update: concepts/react-hooks.md`,
+          `save_reference: references/rfc/rfc-9110.txt`
+
+The explicit `.` pathspec on both commands is load-bearing: when several vaults
+share one enclosing repo, it keeps a write to one vault from staging or
+committing another vault's unrelated working-tree changes. Within the written
+vault, `-A` does sweep up any other pending changes (files edited in Obsidian
+since the last write, for instance) — that is inherent to `add -A`.
+
+Failure modes, all returning a warning of the form
+"git commit skipped for <vault>: <detail>", never an exception: git not on
+PATH, no committer identity configured, index lock held, 15s timeout.
+
+Read-only tools (read, search, list, list_vaults) and create_folder never
+commit.
+
+7.2 log.md
+----------
+One `log.md` per vault, at the vault ROOT — not per directory. Plain markdown,
+no frontmatter, appended to on every successful write.
+
+Entry format, under a `## YYYY-MM-DD` heading for the day (UTC, same clock as
+the frontmatter dates):
+
+    # Log
+
+    ## 2026-08-17
+
+    * **Creation**: [[concepts/react-hooks]] — React Hooks
+    * **Update**: [[concepts/react-hooks]] — React Hooks
+    * **Reference**: references/rfc/rfc-9110.txt
+
+  - save -> "Creation", update -> "Update", save_reference -> "Reference".
+  - Notes are linked as wikilinks with the `.md` dropped. References are logged
+    as plain paths, since a reference need not be markdown.
+  - The title suffix (" — <title>") is included when known: from the `title`
+    argument for save, from existing frontmatter for update, never for
+    save_reference.
+
+Placement rules (appendUnderToday, a pure function):
+  - Missing/empty file  -> written as "# Log\n\n## <today>\n\n<entry>\n".
+  - Today's heading absent -> the day section is appended at the END of the
+    file (days accumulate top to bottom).
+  - Today's heading present -> the entry goes after the last non-blank line of
+    that section, leaving following day sections untouched.
+  - Anything outside today's section — hand-written prose, older days — is
+    preserved byte-for-byte.
+
+log.md is a normal file in the vault: it is committed with the write, and it
+shows up in `list` and `search` results (with status/created "unknown", having
+no frontmatter). See §11.
+
+
+8. SHARED TEXT HELPERS
+----------------------
+
+toKebabCase(title)
+    lowercase -> strip everything outside [a-z0-9 \s-] -> whitespace runs to
+    "-" -> collapse repeated "-" -> trim leading/trailing "-".
+    Non-Latin scripts are stripped entirely; a title of only such characters
+    yields an empty filename stem (".md"). Cyrillic titles are rejected earlier
+    in `save`.
+
+todayISO() -> new Date().toISOString() date part, i.e. UTC YYYY-MM-DD.
+
+findWordPositions(content, words) -> Map<word, number[]>
+    Case-insensitive scan over the lowercased content, non-overlapping.
+
+extractBestSnippet(content, words, windowSize = 150)
+    Picks the occurrence anchor that starts the 150-char window containing the
+    most occurrences, backs up 20 chars, slices 150 chars, replaces newlines
+    with spaces, and prefixes/suffixes "..." when the slice is not at a
+    boundary. Returns "" when no word occurs.
+
+describeVaultLayouts(vaults) -> "tech: concepts, projects; wh40k: flat, no subfolders"
+firstTopLevelFolder(vault) -> first folder name, used to build the example path
+    inside a schema description.
+
+
+9. FILE LAYOUT
+--------------
+
+src/index.ts             entry point; loads vaults.json, wires stdio transport,
+                         re-exports internals for tests. `main()` runs only when
+                         the module is the direct entry (isDirectRun compares
+                         import.meta.url with pathToFileURL(process.argv[1]).href,
+                         so paths containing spaces are handled).
+src/server.ts            createServer(registry|path): async; snapshots top-level
+                         folders, constructs McpServer, registers all 7 tools.
+src/vaults.ts            VaultRegistry, loadVaultConfig, toRegistry, resolveVault.
+src/paths.ts             normalizeVaultPath, resolveVaultPath, getAllMarkdownFiles,
+                         listTopLevelFolders, assertKnownTopLevelFolder.
+src/text.ts              pure helpers (§8) — no filesystem access.
+src/hooks.ts             afterWrite — the single post-write hook (§7).
+src/git.ts               findRepoRoot, ensureRepo, commitVault (§7.1). Shells out
+                         via child_process; no git library.
+src/log.ts               formatLogEntry + appendUnderToday (pure) and
+                         appendLogEntry (the fs write) (§7.2).
+src/sources.ts           sourceSchema (zod), sourceKey, mergeSources — shared by
+                         save and update.
+src/tools/<name>.ts      one file per tool, each exporting
+                         register<Name>(server, registry, vaultFolders?).
+                         save_reference also exports referencePath/REFERENCES_DIR.
+src/*.test.ts            vitest.
+
+Commands:
+    npm run build       tsc -p tsconfig.build.json -> dist/
+    npm start           node dist/index.js
+    npm test            vitest run
+    npm run test:watch  vitest
+    npx vitest run src/paths.test.ts
+No lint script is configured.
+
+Manual testing: cp vaults_example.json vaults.json, edit it, then
+    node dist/index.js
+or  npx @modelcontextprotocol/inspector node dist/index.js
+
+
+10. TESTING CONVENTION
+---------------------
+
+Tests mix pure unit tests of text.ts/paths.ts helpers with integration tests
+that start a real `createServer` over InMemoryTransport against a scratch vault
+created with mkdtemp. New tool tests should follow that pattern (in-memory
+client/server pair + temp directory) rather than mocking the filesystem.
+
+Write-path tests (src/history.test.ts) run REAL git against the temp vault
+rather than mocking child_process. Two things matter there:
+  - `git init` the temp vault in beforeEach AND set a local user.email/user.name,
+    otherwise commits depend on the machine's global git identity and the
+    assertions become environment-dependent.
+  - The enclosing-repo case is covered by creating one repo with two vault
+    directories inside it and asserting that a write to one vault commits only
+    its own subtree.
+A test that never writes never touches git; the hook is the only caller.
+
+
+11. KNOWN LIMITS / NON-GOALS
+----------------------------
+
+- No delete, move, rename or append tool, and no update_reference (§6.2).
+- log.md is itself a markdown file at the vault root, which has two knock-on
+  effects worth knowing before extending anything:
+    * it appears in `list` and `search` results, with status and created
+      "unknown" (it has no frontmatter);
+    * it accumulates every note title ever written, and `save`'s duplicate
+      check scans every markdown file in the vault — so as the log grows, it
+      will increasingly match the titleWords of new saves and cause `save` to
+      return "potentially similar note(s)" pointing at log.md. `save`'s
+      duplicate logic is deliberately left untouched here; excluding log.md
+      from that one scan (not from list/search) is the obvious fix if this
+      becomes annoying in practice.
+- History is only as good as the commit scope: `git add -A -- .` commits
+  everything pending inside the written vault, not just the file the tool
+  wrote. Edits made in Obsidian since the last write ride along in the next
+  tool-triggered commit.
+- No history-reading tool. Commits are written but nothing exposes `git log`,
+  diffs, or previous revisions over MCP.
+- No search index; every search/list/duplicate-check reads every markdown file
+  in the target vault(s) synchronously in sequence. Cost is O(vault size) per
+  call.
+- Search is substring-based with AND semantics: no fuzzy matching, stemming,
+  phrase queries, tag/frontmatter filters, or regex.
+- `list`'s folder filter is a raw string prefix, not path-segment aware.
+- The vault-folder snapshot embedded in tool descriptions is taken at startup;
+  folders created later are enforced correctly but not reflected in the
+  description text until the server restarts.
+- `save` overwrites an existing file at the target path without warning once the
+  duplicate check passes or is forced.
+- Dates are UTC-based, date-only (YYYY-MM-DD).
+- Binary/non-markdown vault files are invisible to `search` and `list`, which
+  glob `**/*.md` only. `read` will read any file by path. This applies to
+  references: a `.md` reference is searchable, a `.txt` one is not.
+- Single-client stdio only; no HTTP/SSE transport, no auth, no concurrency
+  control (concurrent writes to the same note last-write-wins).
