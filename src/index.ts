@@ -12,6 +12,10 @@ export {
   findWordPositions,
   extractBestSnippet,
 } from "./text.js";
+export { mergeSources, sourceKey } from "./sources.js";
+export { formatLogEntry, appendUnderToday, LOG_FILE } from "./log.js";
+export { findRepoRoot, ensureRepo, commitVault } from "./git.js";
+export { referencePath, REFERENCES_DIR } from "./tools/save_reference.js";
 
 // vaults.json lives in the project root, one level up from the compiled dist/.
 const CONFIG_PATH = fileURLToPath(new URL("../vaults.json", import.meta.url));

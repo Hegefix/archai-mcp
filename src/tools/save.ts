@@ -3,7 +3,12 @@ import { z } from "zod/v3";
 import matter from "gray-matter";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import { join, dirname } from "node:path";
-import { resolveVaultPath, getAllMarkdownFiles, assertKnownTopLevelFolder } from "../paths.js";
+import {
+  normalizeVaultPath,
+  resolveVaultPath,
+  getAllMarkdownFiles,
+  assertKnownTopLevelFolder,
+} from "../paths.js";
 import { type VaultRegistry, resolveVault } from "../vaults.js";
 import {
   toKebabCase,
@@ -13,6 +18,8 @@ import {
   firstTopLevelFolder,
   type VaultFolderInfo,
 } from "../text.js";
+import { sourceSchema, mergeSources } from "../sources.js";
+import { afterWrite } from "../hooks.js";
 
 const CYRILLIC_RE = /[Ѐ-ӿ]/;
 
@@ -43,6 +50,13 @@ export function registerSave(
           .array(z.string())
           .optional()
           .describe("Tags to add to frontmatter"),
+        sources: z
+          .array(sourceSchema)
+          .optional()
+          .describe(
+            "Provenance of the material this note was written from. Recorded in " +
+              "frontmatter as `sources`; entries are deduped on resource + id."
+          ),
         force: z
           .boolean()
           .optional()
@@ -59,7 +73,7 @@ export function registerSave(
           .describe("Vault name (defaults to the primary vault)"),
       },
     },
-    async ({ title, content, folder, tags, force, allowNewTopLevel, vault }) => {
+    async ({ title, content, folder, tags, sources, force, allowNewTopLevel, vault }) => {
       let vaultPath: string;
       try {
         vaultPath = resolveVault(registry, vault);
@@ -158,11 +172,24 @@ export function registerSave(
       if (tags && tags.length > 0) {
         frontmatter["tags"] = tags;
       }
+      if (sources && sources.length > 0) {
+        frontmatter["sources"] = mergeSources([], sources);
+      }
 
       const fileContent = matter.stringify(content, frontmatter);
 
       await mkdir(dirname(fullPath), { recursive: true });
       await writeFile(fullPath, fileContent, "utf-8");
+
+      await afterWrite({
+        tool: "save",
+        vaultName,
+        vaultPath,
+        // Normalized so the log line and commit message carry a posix path
+        // regardless of the platform `join` above ran on.
+        path: normalizeVaultPath(relativePath),
+        title,
+      });
 
       return {
         content: [{ type: "text" as const, text: `Created: [${vaultName}] ${relativePath}` }],

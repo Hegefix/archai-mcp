@@ -9,6 +9,7 @@ import { registerList } from "./tools/list.js";
 import { registerUpdate } from "./tools/update.js";
 import { registerCreateFolder } from "./tools/create_folder.js";
 import { registerListVaults } from "./tools/list_vaults.js";
+import { registerSaveReference } from "./tools/save_reference.js";
 
 export async function createServer(input: string | VaultRegistry): Promise<McpServer> {
   const registry = toRegistry(input);
@@ -25,6 +26,7 @@ export async function createServer(input: string | VaultRegistry): Promise<McpSe
   });
 
   registerSave(server, registry, vaultFolders);
+  registerSaveReference(server, registry);
   registerRead(server, registry, vaultFolders);
   registerSearch(server, registry);
   registerList(server, registry, vaultFolders);
