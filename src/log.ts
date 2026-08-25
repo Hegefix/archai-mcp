@@ -5,12 +5,21 @@ import { todayISO } from "./text.js";
 /** One activity log per vault, at the vault root. */
 export const LOG_FILE = "log.md";
 
-export type WriteKind = "save" | "update" | "save_reference";
+export type WriteKind =
+  | "save"
+  | "update"
+  | "save_reference"
+  | "move"
+  | "bulk_move"
+  | "rewrite_links";
 
 const LABELS: Record<WriteKind, string> = {
   save: "Creation",
   update: "Update",
   save_reference: "Reference",
+  move: "Move",
+  bulk_move: "Move",
+  rewrite_links: "Links",
 };
 
 /**
@@ -19,8 +28,8 @@ const LABELS: Record<WriteKind, string> = {
  * all, so they are logged as plain paths.
  */
 export function formatLogEntry(kind: WriteKind, path: string, title?: string): string {
-  const target =
-    kind === "save_reference" ? path : `[[${path.replace(/\.md$/, "")}]]`;
+  const linkable = kind === "save" || kind === "update" || kind === "move" || kind === "bulk_move";
+  const target = linkable ? `[[${path.replace(/\.md$/, "")}]]` : path;
   const suffix = title && title.trim() !== "" ? ` — ${title}` : "";
   return `* **${LABELS[kind]}**: ${target}${suffix}`;
 }

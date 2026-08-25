@@ -1,8 +1,0 @@
-{
-  "default": "main",
-  "vaults": {
-    "main": "/absolute/path/to/your/vault",
-    "work": "~/Documents/work-vault",
-    "relative": "../sibling-folder/vault"
-  }
-}

@@ -29,8 +29,20 @@ async function initRepo(dir: string): Promise<void> {
   await git(dir, ["config", "user.name", "archai test"]);
 }
 
-async function connect(input: unknown): Promise<Client> {
-  const server = await createServer(input as string);
+/**
+ * `log: true` opts the vault into `log.md` appending, which is off by default —
+ * mirroring the `{ "path": ..., "log": true }` form in vaults.json.
+ */
+async function connect(input: unknown, options?: { log?: boolean }): Promise<Client> {
+  const registry =
+    typeof input === "string" && options?.log === true
+      ? {
+          vaults: new Map([["default", input]]),
+          defaultName: "default",
+          logEnabled: new Set(["default"]),
+        }
+      : input;
+  const server = await createServer(registry as string);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const client = new Client({ name: "test-client", version: "1.0.0" });
@@ -61,7 +73,9 @@ describe("referencePath", () => {
 
 describe("commitVault", () => {
   it("warns instead of throwing when the vault path is unusable", async () => {
-    const warning = await commitVault(join(tmpdir(), "archai-does-not-exist"), "save: x.md");
+    const warning = await commitVault(join(tmpdir(), "archai-does-not-exist"), "save: x.md", [
+      "x.md",
+    ]);
     expect(warning).toContain("git commit skipped");
   });
 });
@@ -120,10 +134,11 @@ describe("write hooks", () => {
       ]);
     });
 
-    it("keeps the note and its log entry in one commit", async () => {
+    it("commits only the note when the vault has not opted into a log", async () => {
       await callTool("save", { title: "Test Note", content: "body", force: true });
       const files = await git(vaultPath, ["show", "--name-only", "--format=", "HEAD"]);
-      expect(files.split("\n").sort()).toEqual(["log.md", "test-note.md"]);
+      expect(files.split("\n")).toEqual(["test-note.md"]);
+      await expect(stat(join(vaultPath, "log.md"))).rejects.toThrow();
     });
 
     it("initializes a repo when the vault has none", async () => {
@@ -153,6 +168,34 @@ describe("write hooks", () => {
   });
 
   describe("log.md", () => {
+    let logClient: Client;
+
+    beforeEach(async () => {
+      logClient = await connect(vaultPath, { log: true });
+    });
+
+    afterEach(async () => {
+      await logClient.close();
+    });
+
+    async function callTool(name: string, args: Record<string, unknown> = {}) {
+      return logClient.callTool({ name, arguments: args });
+    }
+
+    it("is not written at all unless the vault opts in", async () => {
+      await client.callTool({
+        name: "save",
+        arguments: { title: "Unlogged", content: "body", force: true },
+      });
+      await expect(stat(join(vaultPath, "log.md"))).rejects.toThrow();
+    });
+
+    it("keeps the note and its log entry in one commit when enabled", async () => {
+      await callTool("save", { title: "Test Note", content: "body", force: true });
+      const files = await git(vaultPath, ["show", "--name-only", "--format=", "HEAD"]);
+      expect(files.split("\n").sort()).toEqual(["log.md", "test-note.md"]);
+    });
+
     it("records creations, updates and references under today's heading", async () => {
       await callTool("save", {
         title: "Test Note",
@@ -271,7 +314,7 @@ describe("write hooks", () => {
       });
       const parsed = matter(await readFile(join(vaultPath, "test-note.md"), "utf-8"));
       expect(parsed.data["title"]).toBe("Test Note");
-      expect(parsed.data["status"]).toBe("seedling");
+      expect(parsed.data["status"]).toBe("draft");
       expect(parsed.data["tags"]).toEqual(["ts"]);
       expect(parsed.data["sources"]).toEqual([
         {
@@ -340,6 +383,7 @@ describe("vault inside an enclosing repo", () => {
         ["work", join(repoRoot, "work")],
       ]),
       defaultName: "tech",
+      logEnabled: new Set(["tech", "work"]),
     });
   });
 

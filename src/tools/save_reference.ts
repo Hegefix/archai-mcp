@@ -3,7 +3,7 @@ import { z } from "zod/v3";
 import { writeFile, mkdir, stat } from "node:fs/promises";
 import { posix, dirname } from "node:path";
 import { normalizeVaultPath, resolveVaultPath } from "../paths.js";
-import { type VaultRegistry, resolveVault } from "../vaults.js";
+import { type VaultRegistry, resolveVault, isLogEnabled } from "../vaults.js";
 import { afterWrite } from "../hooks.js";
 
 /** Every reference lands under this fixed top-level folder. */
@@ -106,6 +106,7 @@ export function registerSaveReference(server: McpServer, registry: VaultRegistry
         vaultName,
         vaultPath,
         path: relativePath,
+        log: isLogEnabled(registry, vaultName),
       });
 
       return {

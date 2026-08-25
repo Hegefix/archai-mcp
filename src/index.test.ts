@@ -146,7 +146,7 @@ describe("MCP tools", () => {
       const raw = await readFile(filePath, "utf-8");
       const parsed = matter(raw);
       expect(parsed.data["title"]).toBe("Test Note");
-      expect(parsed.data["status"]).toBe("seedling");
+      expect(parsed.data["status"]).toBe("draft");
       expect(parsed.content.trim()).toBe("Hello world");
     });
 
@@ -488,6 +488,7 @@ describe("multi-vault", () => {
   it("list_vaults returns both names and marks the default", async () => {
     const result = await callTool("list_vaults", {});
     expect(result.structuredContent).toEqual({
+      skipped: [],
       vaults: [
         { name: "personal", path: personalPath, default: true },
         { name: "work", path: workPath, default: false },

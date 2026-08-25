@@ -9,7 +9,7 @@ import {
   getAllMarkdownFiles,
   assertKnownTopLevelFolder,
 } from "../paths.js";
-import { type VaultRegistry, resolveVault } from "../vaults.js";
+import { type VaultRegistry, resolveVault, isLogEnabled } from "../vaults.js";
 import {
   toKebabCase,
   todayISO,
@@ -20,6 +20,12 @@ import {
 } from "../text.js";
 import { sourceSchema, mergeSources } from "../sources.js";
 import { afterWrite } from "../hooks.js";
+import { LOG_FILE } from "../log.js";
+import {
+  resolveStatusFields,
+  STATUS_VALUES,
+  DEFAULT_STATUS,
+} from "../frontmatter.js";
 
 const CYRILLIC_RE = /[Ѐ-ӿ]/;
 
@@ -57,6 +63,33 @@ export function registerSave(
             "Provenance of the material this note was written from. Recorded in " +
               "frontmatter as `sources`; entries are deduped on resource + id."
           ),
+        status: z
+          // Deliberately a plain string, not z.enum: a schema-level rejection is an
+          // opaque MCP validation error, and a stale client passing "seedling" needs
+          // to be told what replaced it. resolveStatusFields does that.
+          .string()
+          .optional()
+          .describe(
+            `Note status: ${STATUS_VALUES.join(" | ")}. Defaults to ` +
+              `"${DEFAULT_STATUS}". "verified" means checked against the source and ` +
+              "REQUIRES a verified date. The retired seedling/growing/evergreen scale " +
+              "is rejected with an error naming the replacement."
+          ),
+        verified: z
+          .string()
+          .optional()
+          .describe(
+            'Date (YYYY-MM-DD) the note was checked against its source. Legal only ' +
+              'with status "verified", and required by it.'
+          ),
+        stale_when: z
+          .string()
+          .optional()
+          .describe(
+            "Free-text condition under which this note stops being true, e.g. " +
+              '"prod moves past v1.63.0+2053". Event-based, not a date — that is how ' +
+              "notes actually expire. Never checked automatically; read by a human."
+          ),
         force: z
           .boolean()
           .optional()
@@ -73,7 +106,19 @@ export function registerSave(
           .describe("Vault name (defaults to the primary vault)"),
       },
     },
-    async ({ title, content, folder, tags, sources, force, allowNewTopLevel, vault }) => {
+    async ({
+      title,
+      content,
+      folder,
+      tags,
+      sources,
+      status,
+      verified,
+      stale_when,
+      force,
+      allowNewTopLevel,
+      vault,
+    }) => {
       let vaultPath: string;
       try {
         vaultPath = resolveVault(registry, vault);
@@ -81,6 +126,20 @@ export function registerSave(
         const msg = err instanceof Error ? err.message : String(err);
         return {
           content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
+      }
+
+      const resolvedStatus = resolveStatusFields(
+        {},
+        {
+          ...(status === undefined ? {} : { status }),
+          ...(verified === undefined ? {} : { verified }),
+        }
+      );
+      if (resolvedStatus.error !== undefined) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${resolvedStatus.error}` }],
           isError: true,
         };
       }
@@ -106,6 +165,11 @@ export function registerSave(
         const matches: Array<{ path: string; snippet: string }> = [];
 
         for (const filePath of files) {
+          // The activity log accumulates every note title ever written, so left in
+          // the scan it eventually matches any new title and reports itself as a
+          // near-duplicate of everything. It is never a note.
+          if (filePath === LOG_FILE) continue;
+
           const fileName = filePath.toLowerCase();
           const filenameMatch = titleWords.some((w) => fileName.includes(w));
 
@@ -167,8 +231,14 @@ export function registerSave(
         title,
         created: today,
         updated: today,
-        status: "seedling",
+        status: resolvedStatus.status,
       };
+      if (resolvedStatus.verified !== undefined) {
+        frontmatter["verified"] = resolvedStatus.verified;
+      }
+      if (stale_when !== undefined && stale_when.trim() !== "") {
+        frontmatter["stale_when"] = stale_when;
+      }
       if (tags && tags.length > 0) {
         frontmatter["tags"] = tags;
       }
@@ -189,11 +259,21 @@ export function registerSave(
         // regardless of the platform `join` above ran on.
         path: normalizeVaultPath(relativePath),
         title,
+        log: isLogEnabled(registry, vaultName),
       });
 
       return {
-        content: [{ type: "text" as const, text: `Created: [${vaultName}] ${relativePath}` }],
-        structuredContent: { path: relativePath, vault: vaultName },
+        content: [
+          { type: "text" as const, text: `Created: [${vaultName}] ${relativePath}` },
+        ],
+        structuredContent: {
+          path: relativePath,
+          vault: vaultName,
+          status: resolvedStatus.status,
+          ...(resolvedStatus.verified === undefined
+            ? {}
+            : { verified: resolvedStatus.verified }),
+        },
       };
     }
   );

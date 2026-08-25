@@ -6,6 +6,14 @@ import { loadVaultConfig } from "./vaults.js";
 export { createServer } from "./server.js";
 export { resolveVaultPath, listTopLevelFolders, assertKnownTopLevelFolder } from "./paths.js";
 export {
+  checkStatus,
+  checkVerifiedPairing,
+  resolveStatusFields,
+  STATUS_VALUES,
+  DEFAULT_STATUS,
+  RETIRED_STATUSES,
+} from "./frontmatter.js";
+export {
   toKebabCase,
   describeVaultLayouts,
   firstTopLevelFolder,
@@ -14,7 +22,40 @@ export {
 } from "./text.js";
 export { mergeSources, sourceKey } from "./sources.js";
 export { formatLogEntry, appendUnderToday, LOG_FILE } from "./log.js";
-export { findRepoRoot, ensureRepo, commitVault } from "./git.js";
+export {
+  findRepoRoot,
+  ensureRepo,
+  commitVault,
+  gitMove,
+  listRenamedBasenames,
+  headCommit,
+  stageVault,
+} from "./git.js";
+export { isLogEnabled, partitionAvailableVaults, resolveVault, loadVaultConfig } from "./vaults.js";
+export { scanWikilinks, rewriteWikilinks, renderWikilink } from "./wikilinks.js";
+export {
+  buildVaultIndex,
+  resolveTarget,
+  classifyLink,
+  basenameSimilarity,
+  suggestTarget,
+  summarize,
+  PLANNED_MARKER,
+  LINK_CLASSES,
+} from "./lint-candidates.js";
+export {
+  stem,
+  loadNotes,
+  buildIndex,
+  findBacklinks,
+  preferredTarget,
+  normalizeMapping,
+  planRewrites,
+  describeRewrites,
+} from "./refactor.js";
+export { createJournal } from "./rollback.js";
+export { checkMovable, resolveDestination, titleDivergence } from "./tools/move.js";
+export { validateBatch } from "./tools/bulk_move.js";
 export { referencePath, REFERENCES_DIR } from "./tools/save_reference.js";
 
 // vaults.json lives in the project root, one level up from the compiled dist/.
@@ -27,7 +68,7 @@ async function main(): Promise<void> {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(
-      `${msg}\nCreate vaults.json in the archai-mcp root (copy vaults_example.json).`
+      `${msg}\nCreate vaults.json in the archai-mcp root (copy vaults.example.json).`
     );
     process.exit(1);
   }

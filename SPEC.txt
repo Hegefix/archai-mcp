@@ -18,16 +18,24 @@ in-process.
 
 An MCP server that gives a client read/write access to one or more Obsidian
 vaults (plain directories of markdown files) on the local filesystem. It
-exposes 8 tools, in registration order: save, save_reference, read, search,
-list, update, create_folder, list_vaults.
+exposes 13 tools, in registration order: save, save_reference, read, search,
+list, update, create_folder, list_vaults, find_backlinks, lint_links,
+rewrite_links, move, bulk_move.
+
+The last five are the refactor toolkit (§6.9-§6.13). They exist because renaming
+a note outside the server rots the graph: Obsidian rewrites wikilinks only when
+Obsidian performs the rename, so a filesystem- or agent-driven rename leaves
+every inbound link dangling. `move`/`bulk_move` close that gap; `lint_links` is
+the reactive check for whatever slipped through.
 
 Notes are markdown files with YAML frontmatter. Frontmatter is parsed and
 written with gray-matter. References (see §6.2) are raw files stored verbatim
 with no frontmatter at all.
 
-Every successful write is versioned: it is committed to the vault's git repo
-and appended to the vault's log.md by one shared post-write hook (§7). Nothing
-else in the server commits or logs.
+Every successful write is versioned: it is committed to the vault's git repo by
+one shared post-write hook (§7), which also appends to the vault's log.md when
+that vault has opted in (§7.2 — default OFF). Nothing else in the server commits
+or logs.
 
 
 2. CONFIGURATION
@@ -44,20 +52,57 @@ Config shape:
       "default": "tech",
       "vaults": {
         "tech": "../archai/tech",
-        "warhammer40k": "/absolute/path/to/vault",
-        "work": "~/Documents/work-vault"
+        "work": { "path": "~/Documents/work-vault", "log": true },
+        "other": "/absolute/path/to/vault"
       }
     }
 
 Rules:
-  - `vaults` is required: a non-empty object mapping vault name -> path.
+  - `vaults` is required: a non-empty object mapping vault name -> entry.
+  - An entry is EITHER a bare path string OR an object { path, log? }. The two
+    forms may be mixed freely in one config.
+  - `log` (boolean, default FALSE) opts the vault into `log.md` appending
+    (§7.2). Off means writes are still committed to git, just not logged.
   - Each path may be absolute, `~`-prefixed (expanded to the user home
     directory), or relative (resolved against the directory containing
     vaults.json). Paths are trimmed.
   - `default` is optional. If present it must name a key in `vaults`.
     If absent, the first key in `vaults` (insertion order) becomes the default.
-  - Vault roots are NOT required to exist at startup; a missing root simply
-    reports zero top-level folders.
+  - A configured vault whose directory is ABSENT is skipped, not fatal. See
+    "Absent vaults" below.
+
+Absent vaults (partitionAvailableVaults, run once in createServer):
+
+The vault repo uses `git sparse-checkout`, so one config can list every vault
+while a given machine materializes only some of them (work machine: tech, work;
+personal: psychology, crossfit, business, warhammer40k). That makes a configured
+directory that isn't there the NORMAL case, not an error.
+
+At startup each configured path is stat'd:
+  - a directory  -> the vault is served normally;
+  - anything else (absent, or a non-directory) -> the vault is dropped from
+    `registry.vaults`, recorded in `registry.missing` (name -> configured path),
+    and one warning is printed to STDERR:
+        archai-mcp: vault "<name>" skipped: no directory at <path>
+  - if the configured `default` is absent, the first present vault becomes the
+    default, with a second stderr warning.
+  - if NOTHING is present the server exits: there is nothing to serve.
+        "None of the configured vaults exist on this machine: <name (path)>, …
+         Check vaults.json and your git sparse-checkout."
+
+A skipped vault is never silently served as an empty vault. It is:
+  - absent from `list_vaults`'s `vaults`, and listed in its `skipped` (§6.8);
+  - named in `lint_links`'s `summary.skipped`, so a `healthy: true` never covers
+    a vault that was not read (§6.10);
+  - refused with a distinct message when a tool names it explicitly:
+        vault "<name>" is configured but its directory is missing at <path>, so
+        it was skipped on this machine (check your git sparse-checkout).
+        Available: <a, b>
+    as opposed to the plain `vault "<name>" not found. Available: …` for a name
+    that was never configured at all.
+
+`vaults.json` is per-machine (paths and sparse-checkout selection are local) and
+is gitignored. `vaults.example.json` is the committed template.
 
 Config load errors (all fatal — the process logs to stderr and exits 1):
   - "Cannot read vault config at <path>"
@@ -65,21 +110,30 @@ Config load errors (all fatal — the process logs to stderr and exits 1):
   - "Vault config must be a JSON object with a \"vaults\" map"
   - "Vault config \"vaults\" must be an object mapping names to paths"
   - "Vault \"<name>\" must have a non-empty path"
+  - "Vault \"<name>\" option \"log\" must be a boolean"
   - "Vault config \"vaults\" is empty"
   - "Default vault \"<name>\" is not listed in \"vaults\""
 On failure the message is followed by:
-  "Create vaults.json in the archai-mcp root (copy vaults_example.json)."
+  "Create vaults.json in the archai-mcp root (copy vaults.example.json)."
 
-`vaults_example.json` is the committed template; `vaults.json` is gitignored.
+`vaults.example.json` is the committed template; `vaults.json` is gitignored and
+must stay that way — it encodes one machine's layout.
 
 Embedding: `createServer(input)` accepts either a VaultRegistry or a bare path
-string. A bare string is normalized into a single vault named "default".
+string. A bare string is normalized into a single vault named "default" with
+logging OFF (VaultRegistry.logEnabled is an optional Set<string> of vault names;
+isLogEnabled(registry, name) reads it and defaults to false).
 
 
 3. INTERNAL MODEL
 -----------------
 
-VaultRegistry = { vaults: Map<name, absolutePath>, defaultName: string }
+VaultRegistry = { vaults: Map<name, absolutePath>, defaultName: string,
+                  logEnabled?: Set<name>, missing?: Map<name, absolutePath> }
+
+`vaults` holds only vaults present on this machine; `missing` holds the
+configured-but-absent ones (§2). The split is made once, in createServer, so
+every tool sees a registry whose `vaults` are all real.
 
 resolveVault(registry, name?) -> absolute path
   - name undefined => registry.defaultName
@@ -88,8 +142,8 @@ resolveVault(registry, name?) -> absolute path
 
 At startup, `createServer` stats every vault root once and builds
 VaultFolderInfo[] = [{ name, topLevelFolders: string[] }]. This snapshot is
-injected into the *description text* of the save, read, list and create_folder
-schemas so the tool docs show the client the real folder names of the real
+injected into the *description text* of the save, read, list, create_folder,
+find_backlinks and move schemas so the tool docs show the client the real folder names of the real
 vaults instead of hardcoded examples. The snapshot is taken once at startup and
 is NOT refreshed; runtime validation re-reads the filesystem each time.
 
@@ -136,8 +190,11 @@ Only the top-level segment is gated. Arbitrary nesting under an existing
 top-level folder is always permitted and intermediate directories are created
 as needed (e.g. `concepts/react/hooks` is fine once `concepts` exists).
 
-This guard is applied by `save` and `create_folder`, and is bypassed by passing
-`allowNewTopLevel: true`.
+This guard is applied by `save`, `create_folder`, `move` and `bulk_move`, and is
+bypassed by passing `allowNewTopLevel: true`. For tools whose path names a FILE
+rather than a folder (`move`, `bulk_move`), the guard is applied to the
+destination's DIRECTORY part (posix.dirname), which is "." for a vault-root file
+— checking the whole path would reject every root-level note.
 
 
 6. TOOLS
@@ -148,15 +205,24 @@ Common conventions:
   - Errors are returned as isError:true with text "Error: <message>" — they are
     not thrown out of the tool handler.
   - `vault` argument semantics differ by tool:
-      save, save_reference, read, update, create_folder
+      save, save_reference, read, update, create_folder,
+      find_backlinks, rewrite_links, move, bulk_move
                                          -> optional, defaults to the DEFAULT vault
-      search, list                       -> optional, defaults to ALL vaults
-  - Only `read`, `search`, `list` and `list_vaults` carry
-    annotations: { readOnlyHint: true }.
+      search, list, lint_links           -> optional, defaults to ALL vaults
+  - Only `read`, `search`, `list`, `list_vaults`, `find_backlinks` and
+    `lint_links` carry annotations: { readOnlyHint: true }.
   - Schemas are declared with zod/v3 shapes (the SDK's registerTool expects v3).
-  - save, save_reference and update each call the post-write hook (§7) exactly
-    once, after a successful write and before returning. create_folder does not
-    (it writes no content). The hook's outcome never changes the tool result.
+  - save, save_reference, update, rewrite_links, move and bulk_move each call the
+    post-write hook (§7) exactly once, after a successful write and before
+    returning. create_folder does not (it writes no content), nor do the
+    read-only tools. The hook's outcome never changes the tool result.
+  - Every mutating tool added by the refactor toolkit (rewrite_links, move,
+    bulk_move) takes `dry_run` (default false). A dry run computes the change
+    through exactly the same code path as a real run, reports it, and writes
+    nothing — no file, no commit, no log entry.
+
+Tool count: 13. Eight original (§6.1-6.8) plus the five refactor tools
+(§6.9-6.13).
 
 
 6.1 save
@@ -174,12 +240,19 @@ Input:
                                         Source = { resource: string (required),
                                         id?, title?, author?, last_modified? },
                                         all strings. Deduped on resource+id.
+  status            string    optional  "draft" | "verified". Defaults to
+                                        "draft". See §13.
+  verified          string    optional  YYYY-MM-DD. Required by and exclusive to
+                                        status "verified". See §13.
+  stale_when        string    optional  Free-text expiry condition. See §13.
   force             boolean   optional  Skip the duplicate check.
   allowNewTopLevel  boolean   optional  Permit an unknown top-level folder.
   vault             string    optional  Defaults to the default vault.
 
 Order of operations (important — the checks short-circuit in this order):
   1. resolveVault. Unknown vault -> isError.
+  1a. status/verified validation (§13) -> isError before anything is read or
+      written.
   2. Cyrillic check: if /[Ѐ-ӿ]/ matches the title -> isError
      "Error: title contains Cyrillic characters. Use Latin transliteration instead."
   3. Duplicate check, unless force === true:
@@ -214,7 +287,7 @@ Order of operations (important — the checks short-circuit in this order):
          title:   <title>
          created: <YYYY-MM-DD, today, UTC>
          updated: <same>
-         status:  seedling
+         status:  draft            (see §13)
          tags:    [...]        (only when tags is non-empty)
          sources: [...]        (only when sources is non-empty; entries are
                                 normalized — undefined/empty fields dropped,
@@ -315,13 +388,20 @@ Input:
   content  string    required  New markdown body (replaces the existing body).
   sources  Source[]  optional  Provenance to ADD (see §6.1 for the shape).
                                Merged into the note's existing sources.
+  status      string optional  "draft" | "verified". Omit to keep the stored
+                               status. See §13.
+  verified    string optional  YYYY-MM-DD. See §13.
+  stale_when  string optional  Replace the stored condition. Omit to keep it;
+                               pass "" to remove it. See §13.
   vault    string    optional  Defaults to the default vault.
 
 Behaviour:
   - The file must already exist; missing -> isError "Error: file not found at <path>".
-  - Existing frontmatter is parsed and reused as-is; only `updated` is set to
-    today's date (YYYY-MM-DD, UTC). No other field is added or removed — a note
-    with no frontmatter gains a block containing just `updated`.
+  - Existing frontmatter is parsed and reused as-is; `updated` is set to today's
+    date (YYYY-MM-DD, UTC) and `status`/`verified` are resolved per §13. No other
+    field is added or removed — every hand-added field, `stale_when` included,
+    survives untouched. A note with no frontmatter gains a block containing
+    `updated` and `status`.
   - `sources` is the one exception to "reused as-is", and only when the caller
     passes a non-empty array: incoming entries are MERGED into the existing
     list rather than replacing it, because provenance accumulates over a note's
@@ -334,9 +414,12 @@ Behaviour:
     An existing `sources` value that isn't usable source data is dropped rather
     than throwing; a single object (not a list) is treated as a one-entry list.
   - The file is rewritten in full via matter.stringify.
-  - Post-write hook (§7): log.md entry, then commit "update: <path>".
+  - Post-write hook (§7): log.md entry when enabled, then commit
+    "update: <path>", staging only that path.
 
-Output: text `Updated: <path>`; structuredContent { path }.
+Output: text `Updated: <path>`, followed by any §13 notes (a dropped verified
+date, a migrated retired status). structuredContent { path, status, verified?,
+notes? }.
 There is no top-level folder guard and no append mode.
 
 
@@ -430,26 +513,294 @@ structuredContent { created: true, path }.
 Description: list the configured vaults and their filesystem roots. Takes no
 input.
 
-Output text: one line per vault,
+Output text: one line per PRESENT vault,
     - <name>[ (default)]: <absolute path>
-structuredContent: { vaults: [{ name, path, default: boolean }] }
+followed, when any vault was skipped (§2), by
+    Configured but not present on this machine (skipped):
+    - <name>: <configured path>
+structuredContent: { vaults: [{ name, path, default: boolean }],
+                     skipped: [{ name, path }] }
 
-Use the returned names as the `vault` argument on the other tools.
+`vaults` therefore always matches what is actually on disk — a client can trust
+the count. Use the returned names as the `vault` argument on the other tools;
+names under `skipped` will be refused (§2).
+
+
+
+6.9 find_backlinks   (read-only)
+--------------------------------
+Input:  { path: string, vault?: string }
+Output: text "<N> link(s) to [<vault>] <path> in <M> note(s)" followed by one
+        line per hit, "- <file>:<line>  <raw link text>".
+        structuredContent: { vault, note, count, files,
+                             backlinks: [{ file, line, raw, target,
+                                           alias?, heading? }] }
+
+`path` may be a full vault-relative path or a bare basename; it is resolved the
+same way a link is (§12) before the search runs. An unresolvable path is an
+error: "Error: no note matching \"<path>\" in vault \"<vault>\"".
+
+Matching is by link RESOLUTION, not text: `[[x]]`, `[[folder/x]]`, `[[x|Label]]`
+and `[[x#Heading]]` all resolve to the same note and are all reported, each with
+its raw text as written. A note's links to itself are excluded. Links inside
+code are not links (§12) and never appear.
+
+Reads only: no git, no log.md.
+
+
+6.10 lint_links   (read-only)
+-----------------------------
+Input:  { vault?: string, classes?: Array<LinkClass> }
+        vault omitted -> every configured vault.
+        classes restricts which findings are LISTED; the summary always counts
+        everything. Default: every class except "ok".
+Output: a summary line, then one section per class, grouped by vault:
+
+    349 link(s) across 2 vault(s): ok=348 planned=1 external=0
+      renamed-candidate=0 broken=0 | failures=0
+
+    planned (1)
+    [tech]
+    - concepts/frontend/dom-document-object-model.md:114  [[mvc-flux-...]]
+
+        structuredContent: {
+          summary: { total, vaults: string[], ok, planned, external,
+                     "renamed-candidate", broken, failures, healthy,
+                     skipped: string[] },
+          findings: [{ vault, file, line, raw, target, class,
+                       resolved?, suggestion?, suggestionSource?,
+                       externalVault?, ambiguous? }]
+        }
+
+`failures` = broken + renamed-candidate. `healthy` = failures === 0. Every class
+key is always present, so a consumer can read a zero rather than a missing key.
+
+`healthy` speaks ONLY for the vaults in `vaults`. `skipped` names configured
+vaults absent from this machine (§2), and the text summary appends
+` | skipped=<a,b>`. A vault that was never read must not be able to contribute to
+a clean bill of health, so it is reported rather than counted as empty. Naming a
+skipped vault explicitly via `vault` is an isError, not a healthy zero.
+
+The five classes, decided in this order (first match wins):
+
+  ok                 resolves to a note in this vault (§12). `resolved` carries
+                     the note it reached.
+  planned            does not resolve, but the link's LINE contains the marker
+                     "<!-- intentional -->". A deliberate forward link to a note
+                     not written yet. NOT a failure. Beats every class below,
+                     including a rename suggestion.
+  external           does not resolve here, but the target resolves in ANOTHER
+                     configured vault. Each vault is its own Obsidian root, so a
+                     cross-vault wikilink is unresolvable by design. Reported as
+                     its own class, never as broken, and never rewritten by any
+                     tool. `externalVault` names the vault that has it.
+  renamed-candidate  does not resolve, and exactly one high-confidence
+                     replacement exists. `suggestion` is the target to rewrite
+                     to and `suggestionSource` is how it was found:
+                       "git-rename"          — an old basename found in this
+                                               vault's git rename history whose
+                                               new name still exists
+                       "basename-similarity" — score >= 0.75 (§12)
+                     Feed these straight into rewrite_links.
+  broken             does not resolve and nothing convincing to suggest. When
+                     two or more candidates TIED above the threshold, they are
+                     listed in `ambiguous` and the link stays broken rather than
+                     letting a bulk rewrite guess.
+
+Every configured vault is indexed on each call, even when linting only one,
+because "external" is precisely the question "does another vault have this".
+Rename history is read per linted vault and is an enrichment: if git is
+unavailable the map is empty and classification still works.
+
+Reads only: no git writes, no log.md.
+
+
+6.11 rewrite_links
+------------------
+Input:  { mapping: Record<string,string>, dry_run?: boolean, vault?: string }
+Output: "Rewrote +<N> links in <M> files:" then a per-file diff,
+        "  <line>: <old raw> -> <new raw>".
+        Dry run: "Dry run — would rewrite +<N> links in <M> files:" + same diff.
+        No match: "No links matched the mapping in vault \"<vault>\"."
+        structuredContent: { vault, dryRun, links?, files?,
+                             rewrites: [{ file, changes:[{line,from,to}] }] }
+
+Rewrites link TARGETS only. No file is created, deleted or moved; the sole
+change to any note is inside its `[[...]]` text. This is the legacy-repair tool
+and it is also the engine `move`/`bulk_move` use for inbound links.
+
+Mapping semantics:
+  - A key is matched against a link target's BASENAME, exact after dropping any
+    `.md`. One key therefore covers both `[[old]]` and `[[any/folder/old]]`.
+    Matching is deliberately NOT substring/suffix: a key of "state" has no
+    business rewriting "stack-state" and "state-management" in a bulk pass.
+  - Keys and values may carry folders and/or a `.md`; both are normalized
+    through normalizeVaultPath (so a mapping cannot smuggle in `../`).
+  - The WRITTEN form of a replacement comes from preferredTarget (§12): the bare
+    kebab basename when unambiguous in the vault, the full vault-relative path
+    when several notes share that basename. The caller's shape is not echoed.
+  - An empty mapping is an error: "Error: mapping is empty".
+
+Preserved verbatim, and covered by tests:
+    [[old|Some Label]]      -> [[new|Some Label]]
+    [[old#Section]]         -> [[new#Section]]
+    [[old#Section|Label]]   -> [[new#Section|Label]]
+Losing an alias would be a silent content regression, so only the target is
+ever touched.
+
+Atomicity: every file is journaled before it is written (§7.3). If a write
+fails part way through the set, the files already written are restored and the
+call returns isError with "rewrite failed and was rolled back".
+
+Commit message: `rewrite_links: +<N> links in <M> files` — one commit for the
+whole set, not one per file.
+
+
+6.12 move
+---------
+Input:  { from: string, to: string, update_links?: boolean, dry_run?: boolean,
+          allowNewTopLevel?: boolean, vault?: string }
+        update_links defaults to TRUE.
+Output: "Moved: [<vault>] <from> -> <to> (+<N> links in <M> files)" then the
+        link diff, then any notes/warnings.
+        structuredContent: { vault, from, to, dryRun, links, files,
+                             rewrites:[...], titleNote? }
+
+Renames or relocates ONE note and rewrites every inbound wikilink so the graph
+survives. This is the capability whose absence let shell- and agent-driven
+renames rot the graph: Obsidian rewrites links only when Obsidian performs the
+rename.
+
+Destination handling (resolveDestination):
+  - `to` naming an existing DIRECTORY, or ending in "/", keeps the current
+    filename: move("concepts/a.md", "notes") -> "notes/a.md".
+  - `to` with no extension gets ".md" appended.
+  - Otherwise `to` is used as given.
+
+The file is moved with `git mv` (cwd = vault root, vault-relative paths) so the
+change is recorded as a RENAME and history follows it. A plain filesystem
+rename is the fallback when git cannot do it (untracked file, no repo) — the
+move must still happen. Never delete-and-recreate.
+
+Refusals (all isError, nothing written):
+  - `from` or `to` failing path safety (§4) — the EXISTING error strings are
+    used verbatim, e.g. "Error: Path traversal detected: ../outside.md" and
+    "Error: Path must be relative to vault root, got absolute: /etc/x.md".
+  - `to` already exists: "<to> already exists — refusing to overwrite". No
+    silent overwrite, unlike `save`.
+  - `from` does not exist: "file not found at <from>"; not a file: "<from> is
+    not a file".
+  - either side being the vault's `log.md`: "refusing to move <from|to> the
+    vault's log.md".
+  - either side inside `references/`: "refusing to move <from|to> references/:
+    references are immutable captured source material". References stay
+    structurally immutable (§6.2) — there is no edit path into or out of them.
+  - `from` and `to` naming the same note: "from and to are the same path".
+  - an unknown top-level folder in the destination's directory part, unless
+    allowNewTopLevel is true (§5).
+
+Frontmatter `title` is NEVER rewritten. Title and filename are decoupled by
+design (work/mobile/stack-state.md is titled "GoodHabitz Mobile Stack State").
+When they diverge after the move, `titleNote` reports it for the caller to
+judge:
+    frontmatter title "<title>" does not match the new filename "<basename>".
+    Titles are not rewritten by move; update it with the update tool if you
+    want them aligned.
+
+update_links: false moves the file and leaves inbound links dangling, which
+lint_links will then report. Default true.
+
+Link rewriting happens AFTER the move, against a freshly built index, so a
+rewritten link's form reflects the vault as it now stands. A dry run projects
+that post-move index instead, so the diff it reports is the diff a real run
+applies.
+
+Atomicity: both ends of the rename and every rewritten file are journaled
+(§7.3). Any failure restores all of them, re-stages the index (git mv having
+staged its rename) and returns "move failed and was rolled back".
+
+ONE commit for the whole operation:
+    move: <from> -> <to> (+<N> links in <M> files)
+Not one commit per rewritten file.
+
+
+6.13 bulk_move
+--------------
+Input:  { moves: Array<{from: string, to: string}>, dry_run?: boolean,
+          allowNewTopLevel?: boolean, vault?: string }
+Output: "Moved <K> note(s) in [<vault>] (+<N> links in <M> files):" then one
+        "  <from> -> <to>" per move, then the link diff.
+        structuredContent: { vault, dryRun, moves, links, files, rewrites }
+        On rollback: isError, with
+        structuredContent { vault, rolledBack: true, failedEntry?, reason }.
+
+Several renames as ONE atomic unit and ONE commit. Links are always rewritten
+(that is the point of the tool); there is no update_links flag.
+
+The ENTIRE batch is validated before anything moves (validateBatch, pure and
+unit-tested). Rejections report the offending entry's index as
+"batch rejected (moves[<i>]): <reason>":
+  - "moves is empty"
+  - every per-entry refusal from §6.12 (log.md, references/, same path)
+  - "file not found at <from>"
+  - "<from> is moved more than once"
+  - "two moves target <to>"
+  - "<to> already exists and is not being moved out of the way" — a destination
+    may collide only with a note that is itself leaving in this same batch
+  - "<a> and <b> share the basename \"<x>\", so inbound links to it cannot be
+    rewritten unambiguously — move them in separate calls" (links are matched by
+    basename, §6.11)
+  - "moves form a cycle: <a -> b, b -> a>" — a swap needs a temporary name,
+    which this tool deliberately does not invent
+  - an unknown top-level folder in any destination, unless allowNewTopLevel
+
+Ordering: accepted batches are topologically ordered so a destination is always
+vacated before it is filled (a chain a->c, c->z runs c first). Cycles are
+rejected above, so an order always exists.
+
+Rollback: a per-file journal (§7.3) is taken as the batch runs. If any single
+move or the link-rewrite pass fails, EVERY journaled file is restored, the git
+index is re-staged, no commit is made, and the call returns which entry failed
+and why:
+    Error: batch failed at <from> -> <to> and was rolled back in full
+    (<K> file(s) restored): <detail>
+    Vault still at <short sha>.
+A rewrite-stage failure reports "while rewriting links" instead of an entry.
+A half-applied rename wave is worse than a rejected one, so partial success is
+never returned here.
+
+Commit message: `bulk_move: <K> notes (+<N> links in <M> files)`.
 
 
 7. POST-WRITE HOOK (git history + log.md)
 -----------------------------------------
 
-One function, two side effects, called from exactly three places. `save`,
-`save_reference` and `update` each call it once after a successful write:
+One function, two side effects, and the only place either happens. `save`,
+`save_reference`, `update`, `rewrite_links`, `move` and `bulk_move` each call it
+once after a successful write:
 
-    afterWrite({ tool, vaultName, vaultPath, path, title? }) -> string[]
-      tool  : "save" | "update" | "save_reference"
-      path  : vault-relative posix path just written
-      title : note title, used only in the log line
+    afterWrite({ tool, vaultName, vaultPath, path, title?, log?, message? })
+      -> string[]
+      tool    : "save" | "update" | "save_reference" | "move" | "bulk_move"
+                | "rewrite_links"
+      path    : vault-relative posix path just written (for multi-file
+                operations, the representative path used in the log line)
+      title   : note title, used only in the log line
+      log     : append to log.md. Default FALSE — the vault must opt in
+                (§2, §7.2). The commit happens either way.
+      message : override the commit subject. Default "<tool>: <path>".
+                Multi-file operations set it so the whole change lands as one
+                commit describing itself (§6.12, §6.13) rather than one commit
+                per file touched.
+      paths   : the vault-relative paths this write actually touched, used as
+                the commit's pathspec (§7.1). Defaults to [path]. Multi-file
+                operations MUST pass it — both because their `path` is only a
+                representative for the log line, and because the commit is
+                scoped to exactly this list. When a log entry is written,
+                log.md is appended to the list so it lands in the same commit.
 
-Order is load-bearing: the log entry is appended FIRST, then the commit runs,
-so the log line and the note it describes land in the same commit.
+Order is load-bearing: the log entry, when enabled, is appended FIRST, then the
+commit runs, so the log line and the note it describes land in the same commit.
 
 It never throws and never changes the tool result. Failures come back as
 warning strings and are printed to STDERR (stdout is the MCP transport). A
@@ -464,32 +815,87 @@ Repo discovery (ensureRepo):
   - `git init` runs ONLY when the vault is in no work tree at all. Existing
     history is never re-rooted, rewritten, or nested into.
 
-Commit (commitVault), all run with cwd = vault root:
-  1. `git add -A -- .`
-  2. `git status --porcelain -- .`; empty output => nothing to commit, return
-     without a warning (a no-op write is a normal outcome, and `git commit`
-     exits non-zero on an empty commit).
-  3. `git commit -m "<tool>: <path>" -- .`
+Commit (commitVault), all run with cwd = vault root. The pathspec is the list of
+paths the calling tool actually wrote (WriteEvent.paths, §7), never `.`:
+  0. Each requested path is located: on disk, in the index, in HEAD, or nowhere.
+     Nowhere => dropped. This split matters because `git add` and `git commit`
+     disagree about valid pathspecs: `add` is fatal on a path matching neither
+     the worktree nor the index — which is exactly a moved-FROM path after
+     `git mv` — while `commit` also accepts a path that survives only in HEAD,
+     and including it is what makes the commit record an `R` instead of an `A`
+     plus a deletion left pending in the working tree.
+       add pathspec    = paths on disk or in the index
+       commit pathspec = those, plus paths present only in HEAD
+     HEAD membership is tested with `git ls-files --error-unmatch --with-tree=HEAD`
+     and NOT with `git cat-file -e HEAD:<path>`: cat-file resolves paths against
+     the REPO root, which is not the vault root when several vaults share a repo.
+  1. `git add -A -- <add pathspec>` (skipped when empty)
+  2. `git status --porcelain -- <commit pathspec>`; empty output => nothing to
+     commit, return without a warning (a no-op write is a normal outcome, and
+     `git commit` exits non-zero on an empty commit). `git status` tolerates a
+     pathspec matching nothing, unlike add and commit.
+  3. `git commit -m "<message>" -- <commit pathspec>`, the message defaulting to
+     "<tool>: <path>"
      e.g. `save: concepts/react-hooks.md`, `update: concepts/react-hooks.md`,
-          `save_reference: references/rfc/rfc-9110.txt`
+          `save_reference: references/rfc/rfc-9110.txt`,
+          `move: concepts/a.md -> notes/b.md (+4 links in 1 files)`,
+          `bulk_move: 3 notes (+9 links in 4 files)`,
+          `rewrite_links: +12 links in 5 files`
 
-The explicit `.` pathspec on both commands is load-bearing: when several vaults
-share one enclosing repo, it keeps a write to one vault from staging or
-committing another vault's unrelated working-tree changes. Within the written
-vault, `-A` does sweep up any other pending changes (files edited in Obsidian
-since the last write, for instance) — that is inherent to `add -A`.
+The explicit path list is load-bearing twice over:
+
+  - Every configured vault here lives inside ONE repo (there is exactly one
+    `.git`, at `~/Desktop/archai`). An unscoped commit would sweep in whatever
+    else is dirty; on 2026-08-25 that meant the pending deletion of four entire
+    vaults sitting in the working tree, which would have been committed under a
+    message naming a single note.
+  - Even scoped to one vault, the previous `add -A -- .` pulled in unrelated
+    in-progress edits in that vault — notes touched in Obsidian since the last
+    write — under a message naming one file. Listing the written paths keeps a
+    commit's contents equal to its message.
+
+Consequence to rely on: after a tool call, everything the tool did is committed
+and everything else is still pending.
 
 Failure modes, all returning a warning of the form
 "git commit skipped for <vault>: <detail>", never an exception: git not on
 PATH, no committer identity configured, index lock held, 15s timeout.
 
-Read-only tools (read, search, list, list_vaults) and create_folder never
-commit.
+Read-only tools (read, search, list, list_vaults, find_backlinks, lint_links)
+and create_folder never commit.
+
+Other git operations (§6.12, §6.13), all with cwd = vault root:
+  - `git mv -- <from> <to>` (gitMove), with the destination directory created
+    first; falls back to fs.rename when git refuses (untracked file, no repo).
+  - `git log --diff-filter=R --name-status --pretty=format: --relative -- .`
+    (listRenamedBasenames) builds old-basename -> current-basename for rename
+    detection. `--relative` keeps paths vault-relative even in a shared repo;
+    only basenames are kept; chains are followed (a->b then b->c yields a->c),
+    newest rename winning. Unavailable git yields an empty map, not an error.
+  - `git rev-parse HEAD` (headCommit), reported alongside a rolled-back batch.
+  - `git add -A -- <add pathspec>` without committing (stageVault), used after a
+    rollback to resync the index with the restored worktree, since `git mv`
+    stages its rename. Scoped to the paths the operation touched. Silent on
+    failure.
+
+NOTE: git is never used to UNDO anything. See §7.3.
 
 7.2 log.md
 ----------
-One `log.md` per vault, at the vault ROOT — not per directory. Plain markdown,
-no frontmatter, appended to on every successful write.
+OPT-IN, DEFAULT OFF. A vault gets a log only when its config entry says
+`"log": true` (§2); otherwise the append is skipped entirely and the write is
+still committed. The module and the whole code path are retained — this is a
+default flip, not a removal.
+
+Rationale for the default: the log is written in the SAME commit as the change
+it describes, so it restates `git log` with strictly less information. It has no
+dedup (six identical consecutive "Update: 30-percent-ruling" entries across
+18-24 Aug 2026 in the live work vault), it goes stale when unattended (the live
+tech vault had exactly one entry), and as it accumulates note titles it starts
+matching `save`'s duplicate-title scan — see §11.
+
+When enabled: one `log.md` per vault, at the vault ROOT — not per directory.
+Plain markdown, no frontmatter, appended to on every successful write.
 
 Entry format, under a `## YYYY-MM-DD` heading for the day (UTC, same clock as
 the frontmatter dates):
@@ -502,7 +908,11 @@ the frontmatter dates):
     * **Update**: [[concepts/react-hooks]] — React Hooks
     * **Reference**: references/rfc/rfc-9110.txt
 
-  - save -> "Creation", update -> "Update", save_reference -> "Reference".
+  - save -> "Creation", update -> "Update", save_reference -> "Reference",
+    move/bulk_move -> "Move", rewrite_links -> "Links".
+  - "Creation", "Update" and "Move" render the path as a wikilink; "Reference"
+    and "Links" render it as a plain path (a reference need not be markdown, and
+    a link rewrite names a file count rather than a note).
   - Notes are linked as wikilinks with the `.md` dropped. References are logged
     as plain paths, since a reference need not be markdown.
   - The title suffix (" — <title>") is included when known: from the `title`
@@ -520,7 +930,34 @@ Placement rules (appendUnderToday, a pure function):
 
 log.md is a normal file in the vault: it is committed with the write, and it
 shows up in `list` and `search` results (with status/created "unknown", having
-no frontmatter). See §11.
+no frontmatter). It is EXCLUDED unconditionally from `save`'s duplicate-title
+scan (§6.1), from the link graph the refactor tools read (§12), and it cannot be
+moved (§6.12).
+
+
+7.3 ROLLBACK (rewrite_links, move, bulk_move)
+---------------------------------------------
+
+Multi-file writes roll back from a per-file journal (src/rollback.ts), never
+from git:
+
+    createJournal() -> { record(absPath), rollback() -> warnings[], size() }
+
+  - `record` is called BEFORE a path is mutated, every time. It captures the
+    current bytes, or notes the file's absence. Only the first record for a path
+    counts, so re-recording a file this operation already modified cannot
+    overwrite the pristine copy.
+  - `rollback` restores every recorded path: writing the captured bytes back, or
+    unlinking a path that did not exist before. A path that cannot be restored
+    becomes a warning in the tool's error text rather than an exception.
+  - A rename is journaled at BOTH ends (source content captured, destination
+    recorded absent), so undoing it puts the file back.
+
+Why not git: `reset --hard`, `stash` or `checkout .` all reach beyond the files
+these tools touched. Both live vaults share ONE repo (§7.1), and a vault
+normally carries uncommitted Obsidian edits — a git-level undo would revert work
+the server never wrote. The journal restores exactly the recorded paths and
+nothing else. After a rollback, stageVault re-syncs the index (§7.1).
 
 
 8. SHARED TEXT HELPERS
@@ -558,21 +995,42 @@ src/index.ts             entry point; loads vaults.json, wires stdio transport,
                          import.meta.url with pathToFileURL(process.argv[1]).href,
                          so paths containing spaces are handled).
 src/server.ts            createServer(registry|path): async; snapshots top-level
-                         folders, constructs McpServer, registers all 7 tools.
-src/vaults.ts            VaultRegistry, loadVaultConfig, toRegistry, resolveVault.
+                         folders, constructs McpServer, registers all 13 tools.
+src/vaults.ts            VaultRegistry, loadVaultConfig, toRegistry,
+                         resolveVault, isLogEnabled,
+                         partitionAvailableVaults (§2).
+src/frontmatter.ts       status/verified/stale_when rules (§13) — pure, shared by
+                         save and update so they cannot drift.
 src/paths.ts             normalizeVaultPath, resolveVaultPath, getAllMarkdownFiles,
                          listTopLevelFolders, assertKnownTopLevelFolder.
 src/text.ts              pure helpers (§8) — no filesystem access.
 src/hooks.ts             afterWrite — the single post-write hook (§7).
-src/git.ts               findRepoRoot, ensureRepo, commitVault (§7.1). Shells out
-                         via child_process; no git library.
+src/git.ts               findRepoRoot, ensureRepo, commitVault, gitMove,
+                         listRenamedBasenames, headCommit, stageVault (§7.1).
+                         Shells out via child_process; no git library.
+src/wikilinks.ts         scanWikilinks / renderWikilink / rewriteWikilinks (§12).
+                         A character scanner, NOT a regex over the file: it
+                         tracks frontmatter, fenced blocks and inline code spans
+                         so documentation about links is not read as links. Every
+                         link carries byte offsets and its raw text, which is what
+                         makes alias/heading preservation exact.
+src/lint-candidates.ts   buildVaultIndex, resolveTarget, basenameSimilarity,
+                         suggestTarget, classifyLink, summarize (§6.10, §12).
+                         Pure: takes prebuilt indexes and a rename map.
+src/refactor.ts          shared internals for the five refactor tools — loadNotes,
+                         buildIndex, findBacklinks, preferredTarget,
+                         normalizeMapping, planRewrites, applyRewrites,
+                         formatRewrites, describeRewrites.
+src/rollback.ts          createJournal — the per-file undo journal (§7.3).
 src/log.ts               formatLogEntry + appendUnderToday (pure) and
                          appendLogEntry (the fs write) (§7.2).
 src/sources.ts           sourceSchema (zod), sourceKey, mergeSources — shared by
                          save and update.
 src/tools/<name>.ts      one file per tool, each exporting
                          register<Name>(server, registry, vaultFolders?).
-                         save_reference also exports referencePath/REFERENCES_DIR.
+                         save_reference also exports referencePath/REFERENCES_DIR;
+                         move also exports checkMovable/resolveDestination/
+                         titleDivergence; bulk_move also exports validateBatch.
 src/*.test.ts            vitest.
 
 Commands:
@@ -583,7 +1041,7 @@ Commands:
     npx vitest run src/paths.test.ts
 No lint script is configured.
 
-Manual testing: cp vaults_example.json vaults.json, edit it, then
+Manual testing: cp vaults.example.json vaults.json, edit it, then
     node dist/index.js
 or  npx @modelcontextprotocol/inspector node dist/index.js
 
@@ -606,26 +1064,41 @@ rather than mocking child_process. Two things matter there:
     its own subtree.
 A test that never writes never touches git; the hook is the only caller.
 
+log.md is opt-in (§7.2), so a test asserting log content must construct a
+registry with `logEnabled: new Set([...])` — src/history.test.ts's `connect`
+helper takes `{ log: true }` for exactly this.
+
+src/refactor.test.ts covers the refactor toolkit: pure tests of checkMovable,
+titleDivergence and validateBatch, then integration tests over a real server.
+Its bulk_move rollback test forces a genuine mid-batch failure by chmod-ing a
+destination directory to 0o500, so the first rename succeeds and the second
+fails for real — a mocked failure would not exercise the journal.
+src/wikilinks.test.ts, src/lint-candidates.test.ts and src/frontmatter.test.ts
+are pure unit tests.
+
+src/config.test.ts covers configuration and commit scoping: the vaults.json
+`log` option, absent-vault partitioning (including a file where a directory was
+expected, a default that is absent, and the all-absent failure), the tools'
+skipped reporting, the status/verified/stale_when behaviour end to end, and the
+commit pathspec — asserting that an unrelated edit in the same vault stays
+pending after a write, and that a move still records as an `R`. Note that
+`git show --name-only` collapses a rename to its destination; enumerate a
+commit's paths with `--no-renames`, and note that a test helper trimming
+`git status --porcelain` output also strips its leading status column space.
+
 
 11. KNOWN LIMITS / NON-GOALS
 ----------------------------
 
-- No delete, move, rename or append tool, and no update_reference (§6.2).
-- log.md is itself a markdown file at the vault root, which has two knock-on
-  effects worth knowing before extending anything:
-    * it appears in `list` and `search` results, with status and created
-      "unknown" (it has no frontmatter);
-    * it accumulates every note title ever written, and `save`'s duplicate
-      check scans every markdown file in the vault — so as the log grows, it
-      will increasingly match the titleWords of new saves and cause `save` to
-      return "potentially similar note(s)" pointing at log.md. `save`'s
-      duplicate logic is deliberately left untouched here; excluding log.md
-      from that one scan (not from list/search) is the obvious fix if this
-      becomes annoying in practice.
-- History is only as good as the commit scope: `git add -A -- .` commits
-  everything pending inside the written vault, not just the file the tool
-  wrote. Edits made in Obsidian since the last write ride along in the next
-  tool-triggered commit.
+- No delete and no append tool, and no update_reference (§6.2). Move/rename
+  now exists (§6.12, §6.13); delete is still deliberately absent.
+- log.md, when a vault opts in (§7.2), is a markdown file at the vault root and
+  so appears in `list` and `search` results with status and created "unknown"
+  (it has no frontmatter). It is excluded from `save`'s duplicate-title scan and
+  from the refactor tools' link graph, but NOT from list/search.
+- A commit contains exactly the paths the tool wrote (§7.1). Concurrent edits to
+  those same paths from elsewhere are still captured, since staging reads the
+  working tree at commit time — there is no locking.
 - No history-reading tool. Commits are written but nothing exposes `git log`,
   diffs, or previous revisions over MCP.
 - No search index; every search/list/duplicate-check reads every markdown file
@@ -640,8 +1113,161 @@ A test that never writes never touches git; the hook is the only caller.
 - `save` overwrites an existing file at the target path without warning once the
   duplicate check passes or is forced.
 - Dates are UTC-based, date-only (YYYY-MM-DD).
+- `stale_when` is never evaluated. Nothing checks whether the condition has come
+  true; it is prose for a human reading the note (§13).
+- The absent-vault check is a startup snapshot. A vault that appears or vanishes
+  while the server is running is not noticed until restart.
 - Binary/non-markdown vault files are invisible to `search` and `list`, which
   glob `**/*.md` only. `read` will read any file by path. This applies to
   references: a `.md` reference is searchable, a `.txt` one is not.
 - Single-client stdio only; no HTTP/SSE transport, no auth, no concurrency
   control (concurrent writes to the same note last-write-wins).
+
+Refactor-toolkit limits specifically:
+- Link resolution has no "shortest unique path" tie-break by proximity the way
+  Obsidian does: when several notes share a basename, the lexicographically
+  first path wins (§12). Stable, but arbitrary.
+- Inline code spans are matched within a single line. A code span left unclosed
+  on its line is treated as literal backticks rather than continuing to the next
+  line as CommonMark would. The alternative — swallowing the rest of the file —
+  is worse, and the shape does not occur in prose.
+- Links inside HTML comments are still links. Only code and frontmatter are
+  excluded; `<!-- [[x]] -->` is scanned normally.
+- Markdown links (`[text](path.md)`), embeds' `!` prefix aside, and Obsidian
+  block references (`[[x#^block-id]]`, handled as an ordinary heading anchor)
+  are not specially modelled. Only `[[...]]` targets are ever rewritten.
+- rewrite_links matches mapping keys by exact basename only. A note whose
+  basename is not unique in the vault cannot be targeted by basename alone;
+  there is no path-keyed mapping form.
+- bulk_move rejects cycles rather than staging through a temporary name, so a
+  straight swap of two filenames takes two calls.
+- Rename suggestions are heuristic. `basename-similarity` at >= 0.75 can propose
+  a wrong target, which is why suggestions are returned for a caller to apply
+  rather than applied automatically, and why ties are reported as broken instead
+  of guessed.
+- listRenamedBasenames keeps only basenames, so two notes that shared a basename
+  in different folders before a rename are indistinguishable in the map.
+- `move` and `bulk_move` stage both ends of each rename plus every note whose
+  links changed, and nothing else.
+- The rollback journal holds file contents in memory. Fine at this scale (tens
+  of small markdown files); it is not a general-purpose transaction log.
+
+
+12. LINK SEMANTICS (wikilinks)
+------------------------------
+
+What counts as a link (scanWikilinks):
+  - `[[target]]`, `[[folder/target]]`, `[[target|alias]]`, `[[target#heading]]`
+    and `[[target#heading|alias]]`. The pipe is found first, so a `#` inside an
+    alias stays part of the alias.
+  - The target is trimmed; the heading and alias are kept VERBATIM, which is how
+    a rewrite preserves them byte-for-byte.
+  - Embeds `![[x]]` are links; the `!` sits outside the recorded raw text, so
+    rewriting an embed's target keeps it an embed.
+
+What does NOT count:
+  - Anything inside a fenced code block (``` or ~~~, 3+ chars, indented up to 3
+    spaces; a closing fence must match the opening char and be at least as long,
+    and carry no info string). Live case: `[[wikilinks]]` documented inside a
+    fence.
+  - Anything inside an inline code span (matched backtick runs of equal length).
+    Live case: tech/patterns/karpathys-llm-knowledge-base-pattern.md:53 reads
+    "creates/updates notes with `[[wikilinks]]`" and must not be read as a link
+    to a note named "wikilinks".
+  - Anything inside YAML frontmatter (a `---` FIRST line, closed by `---` or
+    `...`; a `---` mid-document is a horizontal rule, not frontmatter).
+  - `[[]]` and same-document anchors `[[#Section]]` — they name no other note.
+
+Resolution (resolveTarget), matching Obsidian:
+  1. the target text as a vault-rooted path (a trailing `.md` is tolerated);
+  2. failing that, the BASENAME anywhere in the vault. This is why `[[x]]` with
+     no folder prefix reaches deep/folders/x.md, and why a wrong folder prefix
+     still resolves.
+  Several notes sharing a basename: lexicographically first wins (see §11).
+
+Written form (preferredTarget): the bare basename when it is unambiguous in the
+vault, the full vault-relative path when it is not. Obsidian's own
+shortest-unique convention, so rewritten links look like hand-written ones.
+
+Graph membership: `log.md` and everything under `references/` are excluded from
+the link graph the refactor tools read and write. A `[[...]]` inside a reference
+is part of captured source bytes, not a claim about this vault's graph, and
+rewriting one would corrupt the capture.
+
+Similarity scoring (basenameSimilarity, 0..1, best signal wins):
+  - token containment: every token of one name appears in the other -> 0.90.
+    Guarded to multi-token names or a single token of 8+ chars, so "react" does
+    not claim "react-query" while "stack-state" does match
+    "goodhabitz-mobile-stack-state".
+  - token overlap (Dice coefficient) for reorderings and partial edits.
+  - character similarity, 1 - levenshtein/maxLength, for typos and suffix
+    changes.
+Threshold for a suggestion: 0.75 (SUGGESTION_THRESHOLD).
+
+13. FRONTMATTER FIELDS (status, verified, stale_when)
+-----------------------------------------------------
+
+Rules live in src/frontmatter.ts and are enforced identically by `save` and
+`update`, so the two cannot drift.
+
+status — the whole scale is TWO values:
+
+    draft      anything not checked against its source. The DEFAULT.
+    verified   checked against the source on the date in `verified`.
+
+Retired scale: `seedling`, `growing`, `evergreen`. These are REJECTED by name,
+not silently accepted:
+
+    status "seedling" is no longer accepted — the scale is draft | verified. Use
+    "draft" for anything unverified, or "verified" together with a
+    verified: YYYY-MM-DD date recording when it was checked against the source.
+
+The four-state scale carried no information — 58 of 76 notes sat in `seedling`
+purely because it was the default — so a stale client quietly reintroducing it
+has to fail loudly. Note that the `status` input is typed as a plain string, not
+a zod enum, precisely so this message is reachable: an enum would reject the
+value at the schema layer as an opaque MCP validation error.
+
+An unrecognized value that is not a retired one:
+
+    status must be one of draft | verified, got "<value>"
+
+verified — a YYYY-MM-DD date. The pairing invariant, both directions:
+
+  - `status: verified` with no date -> isError
+        status "verified" requires a verified: YYYY-MM-DD date recording when the
+        note was checked against its source. Pass verified, or use status "draft".
+  - a date with any other status -> isError
+        a verified date is only meaningful with status "verified" (got "draft").
+        Set status "verified" or drop the verified date.
+  - a date that isn't YYYY-MM-DD -> isError
+        verified must be a YYYY-MM-DD date, got <json>
+
+`verified` means "checked against the source ON this date". A verified status
+with no date is an unfalsifiable claim; a date under a draft status is a leftover
+from a demotion. Either makes the field useless for deciding whether to trust a
+note, which is the only reason it exists.
+
+Resolution on update (resolveStatusFields), caller input winning over stored:
+  - neither supplied      -> the stored pair is kept as-is.
+  - status only, "verified" -> requires a stored or supplied date.
+  - status only, "draft"  -> a stored `verified` date is DROPPED, with a note in
+                             the output: "dropped the verified date (<d>) — it
+                             only applies to status \"verified\"."
+  - verified only         -> refused unless the resulting status is "verified".
+  - a stored status from the retired scale, with no caller status -> migrated to
+    "draft", with a note: "stored status \"seedling\" is from the retired scale
+    and was normalized to \"draft\"." (No live note is in this state; it is a
+    safety net for hand-edited or old files.)
+  - a stored pair that is itself inconsistent (draft + a date) -> isError, so the
+    note is not rewritten around a contradiction.
+
+stale_when — free text, optional, never validated and never evaluated:
+
+    stale_when: 'prod moves past v1.63.0+2053 or the content model changes'
+
+The condition under which the note stops being true. Deliberately event-based
+rather than a date, because that is how these notes actually expire. Nothing
+checks it; it is read by a human opening the note. `save` writes it when given;
+`update` replaces it when given, removes it when given as "", and leaves it alone
+when omitted — like every other frontmatter field it does not manage.
