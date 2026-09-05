@@ -37,10 +37,14 @@ Requires a `vaults.json` in the project root.
 - `src/vaults.ts` — vault registry: loads `vaults.json`, resolves a vault name to a root path
 - `src/paths.ts` — vault path normalization, traversal protection, file discovery
 - `src/text.ts` — kebab-case conversion, local-date stamp, search helpers
+- `src/wikilinks.ts` — markdown AST scan/rewrite of `[[wikilinks]]` and markdown links; skips code spans and fenced blocks, so a `[[link]]` in backticks is not a link
+- `src/refactor.ts` — link recomputation for moved files, `updated` bumping, ambiguity detection
+- `src/lint-candidates.ts` — similarity scoring and classification of broken link targets
 - `src/tools/` — one file per tool
 - Stdio transport — designed to be launched by an MCP client (Claude Code, Cursor, etc.)
 - Filesystem-backed — all operations read/write markdown files directly in the vault
 - `gray-matter` for frontmatter parsing/serialization
 - `glob` for file discovery
 - Multi-vault: every tool takes an optional `vault` arg. `save`/`read`/`update`/`create_folder` default to the primary vault; `search`/`list` span all vaults (labeled `[name]`) unless scoped.
-- Seven tools: `save`, `read`, `search`, `list`, `update`, `create_folder`, `list_vaults`
+- Eleven tools: `save`, `read`, `search`, `list`, `update`, `create_folder`, `list_vaults`, `lint_links`, `find_backlinks`, `move`, `rewrite_links`
+- The link layer (`lint_links`, `find_backlinks`, `move`, `rewrite_links`) was removed in `a9e2446` and restored on 5 Sep 2026, retrofitted for the vault registry that landed after it. `bulk_move`, `delete`, `delete_folder`, `list_folders` and `set_status` stay removed.

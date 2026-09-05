@@ -7,6 +7,10 @@ import { registerList } from "./tools/list.js";
 import { registerUpdate } from "./tools/update.js";
 import { registerCreateFolder } from "./tools/create_folder.js";
 import { registerListVaults } from "./tools/list_vaults.js";
+import { registerLintLinks } from "./tools/lint_links.js";
+import { registerFindBacklinks } from "./tools/find_backlinks.js";
+import { registerMove } from "./tools/move.js";
+import { registerRewriteLinks } from "./tools/rewrite_links.js";
 
 export function createServer(input: string | VaultRegistry): McpServer {
   const registry = toRegistry(input);
@@ -22,6 +26,10 @@ export function createServer(input: string | VaultRegistry): McpServer {
   registerUpdate(server, registry);
   registerCreateFolder(server, registry);
   registerListVaults(server, registry);
+  registerLintLinks(server, registry);
+  registerFindBacklinks(server, registry);
+  registerMove(server, registry);
+  registerRewriteLinks(server, registry);
 
   return server;
 }

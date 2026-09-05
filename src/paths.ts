@@ -35,6 +35,29 @@ export function resolveVaultPath(vaultPath: string, relativePath: string): strin
   return resolved;
 }
 
+export function relativeFromTo(fromFile: string, toFile: string): string {
+  const fromDir = path.posix.dirname(normalizeVaultPath(fromFile));
+  const toNorm = normalizeVaultPath(toFile);
+  return path.posix.relative(fromDir, toNorm);
+}
+
+export function vaultBasename(rel: string): string {
+  return path.posix.basename(normalizeVaultPath(rel), ".md");
+}
+
+export function getAllAttachmentFiles(
+  vaultPath: string,
+  extensions: readonly string[]
+): Promise<string[]> {
+  return glob(`**/*.{${extensions.join(",")}}`, {
+    cwd: vaultPath,
+    ignore: [".obsidian/**"],
+    nodir: true,
+    posix: true,
+    nocase: true,
+  });
+}
+
 export function getAllMarkdownFiles(vaultPath: string): Promise<string[]> {
   return glob("**/*.md", {
     cwd: vaultPath,
