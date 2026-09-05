@@ -8,7 +8,6 @@ import matter from "gray-matter";
 import {
   createServer,
   toKebabCase,
-  inferFolder,
   findWordPositions,
   extractBestSnippet,
   resolveVaultPath,
@@ -36,20 +35,6 @@ describe("toKebabCase", () => {
 
   it("handles empty string", () => {
     expect(toKebabCase("")).toBe("");
-  });
-});
-
-describe("inferFolder", () => {
-  it("returns private/personal for personal content", () => {
-    expect(inferFolder("My career goals for 2025")).toBe("private/personal");
-  });
-
-  it("returns public/tech for technical content", () => {
-    expect(inferFolder("React hooks patterns")).toBe("public/tech");
-  });
-
-  it("defaults to public/tech for neutral content", () => {
-    expect(inferFolder("Some random note")).toBe("public/tech");
   });
 });
 
@@ -134,7 +119,7 @@ describe("MCP tools", () => {
       const raw = await readFile(filePath, "utf-8");
       const parsed = matter(raw);
       expect(parsed.data["title"]).toBe("Test Note");
-      expect(parsed.data["status"]).toBe("seedling");
+      expect(parsed.data["status"]).toBe("draft");
       expect(parsed.content.trim()).toBe("Hello world");
     });
 
@@ -154,22 +139,63 @@ describe("MCP tools", () => {
       expect(parsed.data["tags"]).toEqual(["ts", "mcp"]);
     });
 
-    it("infers public/tech for technical content", async () => {
+    it("creates at vault root when no folder is given", async () => {
       const result = await callTool("save", {
         title: "React Hooks",
         content: "useState patterns",
         force: true,
       });
-      expect(getText(result)).toContain("public/tech");
+      expect(getText(result)).toContain("Created: [default] react-hooks.md");
     });
 
-    it("infers private/personal for personal content", async () => {
-      const result = await callTool("save", {
-        title: "My Goals",
-        content: "career growth and personal development goals",
+    it("refuses to overwrite an existing note even with force", async () => {
+      await callTool("save", {
+        title: "Overwrite Me",
+        content: "original",
+        folder: "public/tech",
         force: true,
       });
-      expect(getText(result)).toContain("private/personal");
+      const result = await callTool("save", {
+        title: "Overwrite Me",
+        content: "replacement",
+        folder: "public/tech",
+        force: true,
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("already exists");
+
+      const raw = await readFile(
+        join(vaultPath, "public/tech/overwrite-me.md"),
+        "utf-8"
+      );
+      expect(matter(raw).content.trim()).toBe("original");
+    });
+
+    it("refuses a basename that already exists in another folder", async () => {
+      await callTool("save", {
+        title: "Shared Name",
+        content: "first",
+        folder: "public/tech",
+        force: true,
+      });
+      const result = await callTool("save", {
+        title: "Shared Name",
+        content: "second",
+        folder: "private/personal",
+        force: true,
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Basenames must be unique");
+    });
+
+    it("rejects a title with no Latin letters or digits", async () => {
+      const result = await callTool("save", {
+        title: "!!! ---",
+        content: "content",
+        force: true,
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("no Latin letters");
     });
 
     it("rejects titles with Cyrillic characters", async () => {
@@ -182,19 +208,34 @@ describe("MCP tools", () => {
       expect(getText(result)).toContain("Cyrillic");
     });
 
-    it("warns about duplicates when force is not set", async () => {
+    it("warns when an existing note contains every word of the title", async () => {
       await callTool("save", {
-        title: "Duplicate Test",
+        title: "Redis Distributed Locks And Leases",
         content: "Original note",
         folder: "public/tech",
         force: true,
       });
       const result = await callTool("save", {
-        title: "Duplicate Test",
+        title: "Redis Distributed Locks",
         content: "Another note",
         folder: "public/tech",
       });
-      expect(getText(result)).toContain("potentially similar");
+      expect(getText(result)).toContain("containing every word of the title");
+    });
+
+    it("does not warn when only some title words match", async () => {
+      await callTool("save", {
+        title: "Redis Caching",
+        content: "Original note",
+        folder: "public/tech",
+        force: true,
+      });
+      const result = await callTool("save", {
+        title: "Kafka Consumer Groups",
+        content: "Unrelated note",
+        folder: "public/tech",
+      });
+      expect(getText(result)).toContain("Created: [default] public/tech/kafka-consumer-groups.md");
     });
   });
 

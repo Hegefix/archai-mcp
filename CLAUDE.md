@@ -17,7 +17,7 @@ node dist/index.js
 The server reads `vaults.json` from the project root (resolved one level up from `dist/`). No env vars. Shape:
 
 ```json
-{ "default": "tech", "vaults": { "tech": "../archai/tech", "warhammer40k": "../archai/warhammer40k" } }
+{ "default": "personal", "vaults": { "personal": "../archai/personal", "work": "../archai/work" } }
 ```
 
 Vault paths may be absolute, `~`-prefixed, or relative to `vaults.json`; `default` is optional (falls back to the first listed vault). `vaults.json` is gitignored; `vaults_example.json` is the committed template.
@@ -36,7 +36,7 @@ Requires a `vaults.json` in the project root.
 - `src/index.ts` — entry point, stdio transport, exports
 - `src/vaults.ts` — vault registry: loads `vaults.json`, resolves a vault name to a root path
 - `src/paths.ts` — vault path normalization, traversal protection, file discovery
-- `src/text.ts` — kebab-case conversion, folder inference, search helpers
+- `src/text.ts` — kebab-case conversion, local-date stamp, search helpers
 - `src/tools/` — one file per tool
 - Stdio transport — designed to be launched by an MCP client (Claude Code, Cursor, etc.)
 - Filesystem-backed — all operations read/write markdown files directly in the vault

@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { readFile } from "node:fs/promises";
 import { glob } from "glob";
 
 export function normalizeVaultPath(input: string): string {
@@ -24,8 +25,11 @@ export function normalizeVaultPath(input: string): string {
 
 export function resolveVaultPath(vaultPath: string, relativePath: string): string {
   const normalized = normalizeVaultPath(relativePath);
-  const resolved = path.join(vaultPath, normalized);
-  if (!resolved.startsWith(vaultPath)) {
+  const resolved = path.resolve(vaultPath, normalized);
+  // A string prefix check would accept a sibling like "/vaults/tech-old" for
+  // vault "/vaults/tech"; compare on segment boundaries instead.
+  const rel = path.relative(path.resolve(vaultPath), resolved);
+  if (rel.startsWith("..") || path.isAbsolute(rel)) {
     throw new Error("Path traversal detected");
   }
   return resolved;
@@ -40,3 +44,15 @@ export function getAllMarkdownFiles(vaultPath: string): Promise<string[]> {
   });
 }
 
+/**
+ * Read a note, yielding null instead of throwing. Vault scans race with Obsidian
+ * and git: a file listed by glob can be gone or unreadable microseconds later,
+ * and one such file must not fail the whole search/list/save call.
+ */
+export async function readNoteOrNull(fullPath: string): Promise<string | null> {
+  try {
+    return await readFile(fullPath, "utf-8");
+  } catch {
+    return null;
+  }
+}

@@ -1,5 +1,6 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
 import { createServer } from "./server.js";
 import { loadVaultConfig } from "./vaults.js";
 
@@ -7,7 +8,6 @@ export { createServer } from "./server.js";
 export { resolveVaultPath } from "./paths.js";
 export {
   toKebabCase,
-  inferFolder,
   findWordPositions,
   extractBestSnippet,
 } from "./text.js";
@@ -31,11 +31,19 @@ async function main(): Promise<void> {
   await server.connect(transport);
 }
 
-const isDirectRun =
-  process.argv[1] &&
-  import.meta.url.endsWith(process.argv[1].replace(/\\/g, "/"));
+// argv[1] can be relative or a symlink; compare resolved real paths. It can
+// also be missing or already gone (test runners, REPL) — treat that as "not us".
+function isDirectRun(): boolean {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(entry);
+  } catch {
+    return false;
+  }
+}
 
-if (isDirectRun) {
+if (isDirectRun()) {
   main().catch((err: unknown) => {
     console.error("Fatal error:", err);
     process.exit(1);

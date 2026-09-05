@@ -1,8 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v3";
 import matter from "gray-matter";
-import { readFile } from "node:fs/promises";
-import { resolveVaultPath, getAllMarkdownFiles } from "../paths.js";
+import { normalizeVaultPath, resolveVaultPath, getAllMarkdownFiles, readNoteOrNull } from "../paths.js";
 import { type VaultRegistry, resolveVault } from "../vaults.js";
 
 type ListEntry = {
@@ -19,12 +18,19 @@ async function listVault(
   folder?: string
 ): Promise<ListEntry[]> {
   const files = await getAllMarkdownFiles(vaultPath);
-  const filtered = folder ? files.filter((f) => f.startsWith(folder)) : files;
+  // Compare on a segment boundary: a raw prefix match would let folder "sci"
+  // pull in everything under "scifi/".
+  const prefix = folder === undefined ? undefined : normalizeVaultPath(folder);
+  const filtered =
+    prefix === undefined || prefix === "."
+      ? files
+      : files.filter((f) => f === prefix || f.startsWith(`${prefix}/`));
 
   const entries: ListEntry[] = [];
   for (const filePath of filtered) {
     const fullPath = resolveVaultPath(vaultPath, filePath);
-    const fileContent = await readFile(fullPath, "utf-8");
+    const fileContent = await readNoteOrNull(fullPath);
+    if (fileContent === null) continue;
     const parsed = matter(fileContent);
 
     entries.push({
@@ -53,7 +59,7 @@ export function registerList(server: McpServer, registry: VaultRegistry): void {
         folder: z
           .string()
           .optional()
-          .describe('Filter by folder prefix, e.g. "public/tech" or "private"'),
+          .describe('Filter by folder, e.g. "tech/concepts". Matches on folder boundaries, not raw prefixes.'),
         vault: z
           .string()
           .optional()
@@ -82,13 +88,23 @@ export function registerList(server: McpServer, registry: VaultRegistry): void {
       }
 
       const entries: ListEntry[] = [];
-      for (const [name, vaultPath] of targets) {
-        entries.push(...(await listVault(name, vaultPath, folder)));
+      try {
+        for (const [name, vaultPath] of targets) {
+          entries.push(...(await listVault(name, vaultPath, folder)));
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return {
+          content: [{ type: "text" as const, text: `Error: ${msg}` }],
+          isError: true,
+        };
       }
 
       entries.sort((a, b) => {
-        if (a.created === "unknown") return 1;
-        if (b.created === "unknown") return -1;
+        const aUnknown = a.created === "unknown";
+        const bUnknown = b.created === "unknown";
+        if (aUnknown !== bUnknown) return aUnknown ? 1 : -1;
+        if (aUnknown) return a.path.localeCompare(b.path);
         return b.created.localeCompare(a.created);
       });
 
