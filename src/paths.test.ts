@@ -1,7 +1,12 @@
 import { describe, it, expect } from "vitest";
+import { mkdtemp, mkdir, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   normalizeVaultPath,
   resolveVaultPath,
+  listTopLevelFolders,
+  assertKnownTopLevelFolder,
 } from "./paths.js";
 
 describe("normalizeVaultPath", () => {
@@ -75,5 +80,75 @@ describe("resolveVaultPath", () => {
     expect(resolveVaultPath("/vault", "public\\tech\\note.md")).toBe(
       "/vault/public/tech/note.md"
     );
+  });
+});
+
+describe("listTopLevelFolders", () => {
+  it("lists real top-level directories, excluding .obsidian", async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), "archai-paths-test-"));
+    try {
+      await mkdir(join(vaultPath, "concepts"));
+      await mkdir(join(vaultPath, "patterns"));
+      await mkdir(join(vaultPath, ".obsidian"));
+      expect(await listTopLevelFolders(vaultPath)).toEqual(["concepts", "patterns"]);
+    } finally {
+      await rm(vaultPath, { recursive: true, force: true });
+    }
+  });
+
+  it("returns an empty array for a flat vault", async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), "archai-paths-test-"));
+    try {
+      expect(await listTopLevelFolders(vaultPath)).toEqual([]);
+    } finally {
+      await rm(vaultPath, { recursive: true, force: true });
+    }
+  });
+
+  it("returns an empty array when the vault root doesn't exist", async () => {
+    expect(await listTopLevelFolders("/nonexistent/archai-vault")).toEqual([]);
+  });
+});
+
+describe("assertKnownTopLevelFolder", () => {
+  it("allows the vault root", async () => {
+    await expect(
+      assertKnownTopLevelFolder("/nonexistent", "test", ".")
+    ).resolves.toBeUndefined();
+  });
+
+  it("allows a path under an existing top-level folder", async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), "archai-paths-test-"));
+    try {
+      await mkdir(join(vaultPath, "concepts"));
+      await expect(
+        assertKnownTopLevelFolder(vaultPath, "test", "concepts/react")
+      ).resolves.toBeUndefined();
+    } finally {
+      await rm(vaultPath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an unknown top-level folder and lists the valid ones", async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), "archai-paths-test-"));
+    try {
+      await mkdir(join(vaultPath, "concepts"));
+      await expect(
+        assertKnownTopLevelFolder(vaultPath, "tech", "public/tech")
+      ).rejects.toThrow(/Unknown top-level folder "public" in vault "tech"/);
+    } finally {
+      await rm(vaultPath, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects with a flat-vault message when there are no top-level folders", async () => {
+    const vaultPath = await mkdtemp(join(tmpdir(), "archai-paths-test-"));
+    try {
+      await expect(
+        assertKnownTopLevelFolder(vaultPath, "work", "notes")
+      ).rejects.toThrow(/no subfolders yet/);
+    } finally {
+      await rm(vaultPath, { recursive: true, force: true });
+    }
   });
 });

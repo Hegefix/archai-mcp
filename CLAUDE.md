@@ -1,50 +1,55 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
 # archai-mcp
 
-MCP server providing read/write access to one or more Obsidian vaults via the filesystem.
+MCP server providing read/write access to one or more Obsidian vaults via the filesystem. Stdio transport, no database — every tool reads/writes markdown files directly. Writes are versioned: every successful write is committed to the vault's git repo from one shared post-write hook, which also appends to the vault's `log.md` when that vault opted in (`"log": true`, **default off**).
 
-## Build
+13 tools. Eight core (`save`, `save_reference`, `read`, `search`, `list`, `update`, `create_folder`, `list_vaults`) plus the refactor toolkit (`find_backlinks`, `lint_links`, `rewrite_links`, `move`, `bulk_move`). `SPEC.txt` at the repo root is the authoritative contract — hand-maintained, not generated; keep it in sync when changing behavior.
 
+## Commands
+
+```bash
+npm run build       # tsc -p tsconfig.build.json → dist/
+npm start            # node dist/index.js
+npm test             # vitest run (all tests, once)
+npm run test:watch   # vitest (watch mode)
+npx vitest run src/paths.test.ts   # run a single test file
 ```
-npm run build
-```
 
-## Run
+There is no lint script configured.
 
-```
-node dist/index.js
-```
-
-The server reads `vaults.json` from the project root (resolved one level up from `dist/`). No env vars. Shape:
+The server reads `vaults.json` from the project root (resolved one level up from `dist/`, see `CONFIG_PATH` in `src/index.ts`). No env vars. Shape:
 
 ```json
-{ "default": "personal", "vaults": { "personal": "../archai/personal", "work": "../archai/work" } }
+{ "default": "tech", "vaults": { "tech": "../archai/tech", "work": { "path": "../archai/work", "log": true } } }
 ```
 
-Vault paths may be absolute, `~`-prefixed, or relative to `vaults.json`; `default` is optional (falls back to the first listed vault). `vaults.json` is gitignored; `vaults_example.json` is the committed template.
-
-## Manual testing
-
-```
-npx @modelcontextprotocol/inspector node dist/index.js
-```
-
-Requires a `vaults.json` in the project root.
+Vault paths may be absolute, `~`-prefixed, or relative to `vaults.json`; `default` is optional (falls back to the first listed vault). `vaults.json` is gitignored; `vaults.example.json` is the committed template. To manually test against real data, `cp vaults.example.json vaults.json`, edit it, then either run `node dist/index.js` directly or via the inspector: `npx @modelcontextprotocol/inspector node dist/index.js`.
 
 ## Architecture
 
-- `src/server.ts` — creates the MCP server, registers all tools, normalizes the vault registry
-- `src/index.ts` — entry point, stdio transport, exports
-- `src/vaults.ts` — vault registry: loads `vaults.json`, resolves a vault name to a root path
-- `src/paths.ts` — vault path normalization, traversal protection, file discovery
-- `src/text.ts` — kebab-case conversion, local-date stamp, search helpers
-- `src/wikilinks.ts` — markdown AST scan/rewrite of `[[wikilinks]]` and markdown links; skips code spans and fenced blocks, so a `[[link]]` in backticks is not a link
-- `src/refactor.ts` — link recomputation for moved files, `updated` bumping, ambiguity detection
-- `src/lint-candidates.ts` — similarity scoring and classification of broken link targets
-- `src/tools/` — one file per tool
-- Stdio transport — designed to be launched by an MCP client (Claude Code, Cursor, etc.)
-- Filesystem-backed — all operations read/write markdown files directly in the vault
-- `gray-matter` for frontmatter parsing/serialization
-- `glob` for file discovery
-- Multi-vault: every tool takes an optional `vault` arg. `save`/`read`/`update`/`create_folder` default to the primary vault; `search`/`list` span all vaults (labeled `[name]`) unless scoped.
-- Eleven tools: `save`, `read`, `search`, `list`, `update`, `create_folder`, `list_vaults`, `lint_links`, `find_backlinks`, `move`, `rewrite_links`
-- The link layer (`lint_links`, `find_backlinks`, `move`, `rewrite_links`) was removed in `a9e2446` and restored on 5 Sep 2026, retrofitted for the vault registry that landed after it. `bulk_move`, `delete`, `delete_folder`, `list_folders` and `set_status` stay removed.
+- `src/server.ts` — creates the `McpServer` and calls each tool's `register*` function against a shared `VaultRegistry`. `createServer` is `async`: it stats each configured vault's top-level directories first (via `listTopLevelFolders`) and passes that `VaultFolderInfo[]` down to the tools whose schema descriptions need real folder examples.
+- `src/index.ts` — entry point; loads `vaults.json`, wires up the stdio transport, and re-exports internals (`createServer`, `resolveVaultPath`, text helpers) that `src/index.test.ts` imports and tests directly. `isDirectRun` guards `main()` so importing this module (as the test does) doesn't start the server.
+- `src/vaults.ts` — `VaultRegistry` = `{ vaults: Map<name, absPath>, defaultName, logEnabled?, missing? }`. A config entry is a bare path string or `{ path, log? }`; `isLogEnabled(registry, name)` reads `logEnabled` and defaults to **false**. `partitionAvailableVaults` splits configured vaults into present (`vaults`) and absent (`missing`) — called once in `createServer`, so every tool sees a registry whose vaults all exist. Absent vaults are normal (the vault repo is a sparse checkout), warned once to stderr, reported as `skipped` by `list_vaults`/`lint_links`, and refused with a "configured but missing" message rather than "not found". Only an entirely empty result is fatal. `loadVaultConfig` parses/validates `vaults.json`; `toRegistry` normalizes a bare path string into a single-vault registry (used when embedding the server without a config file); `resolveVault(registry, name?)` resolves a vault name to its root, throwing a listing of available vaults on a bad name.
+- `src/frontmatter.ts` — `status`/`verified`/`stale_when` rules, pure and shared by `save` and `update` so the two can't drift. Scale is `draft` (default) | `verified`; `verified` pairs both ways with a `verified: YYYY-MM-DD` date; the retired `seedling`/`growing`/`evergreen` values are rejected **by name**. The `status` input is typed `z.string()` and validated in the handler on purpose — a `z.enum` would reject a stale `seedling` at the schema layer as an opaque MCP validation error instead of the actionable message. `stale_when` is free text, never validated, never evaluated.
+- `src/paths.ts` — `normalizeVaultPath`/`resolveVaultPath` are the traversal guard: every tool that touches a file path must route it through `resolveVaultPath(vaultPath, relativePath)` before reading/writing. `getAllMarkdownFiles` globs `**/*.md` under a vault root, excluding `.obsidian/**`. `listTopLevelFolders` reads the vault root's real subdirectories (excluding `.obsidian`) so tool descriptions and validation stay in sync with the filesystem instead of hardcoding folder names. `assertKnownTopLevelFolder` throws unless a relative path's first segment is one of those real top-level folders (vault-root paths are always allowed) — this is the guard behind `save`/`create_folder`'s `allowNewTopLevel` behavior below.
+- `src/hooks.ts` — `afterWrite(event)`, the single post-write hook. `event.paths` is the commit pathspec (defaults to `[event.path]`); multi-file tools must pass it, and `log.md` is appended to it when logging is on so the entry lands in the same commit. `save`, `update`, `save_reference`, `rewrite_links`, `move` and `bulk_move` each call it once after a successful write and nothing else appends to the log or commits. It runs two side effects in order — append to `log.md` (only when `event.log` is true), then commit — so the log entry lands in the same commit as the note. `event.message` overrides the default `<tool>: <path>` commit subject, which is how the multi-file tools land as one commit describing the whole change. It never throws: bookkeeping failures (no git binary, no committer identity, unwritable log) come back as warning strings, are printed to **stderr** (stdout is the MCP transport), and do not fail the tool call.
+- `src/git.ts` — `findRepoRoot`/`ensureRepo`/`commitVault`/`gitMove`/`listRenamedBasenames`/`headCommit`/`stageVault`, via `child_process` (no git library). `commitVault` takes the **explicit path list** the tool wrote as its pathspec, never `.` — all vaults share one repo, so an unscoped commit sweeps in unrelated dirt (on 2026-08-25, the pending deletion of four whole vaults). `add` and `commit` need *different* pathspecs: `add` is fatal on a path that matches neither worktree nor index (exactly a moved-from path after `git mv`), while `commit` accepts a HEAD-only path — and including it is what makes the commit record an `R` rather than an `A` plus a dangling deletion. HEAD membership is tested with `git ls-files --with-tree=HEAD`, **not** `git cat-file -e HEAD:<path>`, because cat-file resolves against the repo root, which is not the vault root here. `gitMove` prefers `git mv` so renames stay renames in history, falling back to `fs.rename` for untracked files. `listRenamedBasenames` parses `git log --diff-filter=R --name-status --relative` into old→current basenames (chains followed, newest wins) to power `lint_links`' `renamed-candidate` class. **git is never used to undo anything** — see `src/rollback.ts`. `ensureRepo` reuses whatever repo already governs the vault — its own `.git` *or an enclosing one*, which is the live setup: both configured vaults are subdirectories of the `archai` notes repo — and only runs `git init` when no repo governs the vault at all, so existing history is never re-rooted. `commitVault` runs `git add -A -- .` and `git commit -m "<tool>: <path>" -- .` from the vault root; the explicit `.` pathspec is load-bearing, since without it a write to one vault would sweep up a sibling vault's unrelated changes in a shared repo. It checks `git status --porcelain -- .` first so a no-op write isn't reported as a failure.
+- `src/log.ts` — `formatLogEntry`/`appendUnderToday` (pure) plus `appendLogEntry` (the fs write). One `log.md` per vault at the vault root — not per-directory. Entries go under a `## YYYY-MM-DD` heading for the day, as `* **Creation**: [[path]] — Title` / `* **Update**: [[path]] — Title` / `* **Reference**: <path>` (references are logged as plain paths since they may not be markdown). Content outside today's section is left untouched.
+- `src/sources.ts` — the zod `sourceSchema` shared by `save` and `update`, plus `mergeSources`/`sourceKey`. Merge key is `resource` + `id`; a matching entry is merged field-wise in place (so a refreshed `last_modified` lands) rather than duplicated, and unknown/garbage existing frontmatter values are dropped rather than thrown on.
+- `src/text.ts` — pure helpers: `toKebabCase` (filename generation for `save`), `findWordPositions`/`extractBestSnippet` (naive scoring/snippet extraction shared by `search` and `save`'s duplicate check), `describeVaultLayouts`/`firstTopLevelFolder` (format a `VaultFolderInfo[]` into the human-readable layout summaries and example paths used in tool descriptions — kept pure and separate from the `listTopLevelFolders` filesystem read in `paths.ts`).
+- `src/wikilinks.ts` — `scanWikilinks`/`renderWikilink`/`rewriteWikilinks`. A **character scanner, not a regex** over the file: it tracks YAML frontmatter, fenced code blocks and inline code spans so that documentation *about* links isn't read as links (there's a live case — ``notes with `[[wikilinks]]` `` in `tech/patterns/karpathys-llm-knowledge-base-pattern.md`). Each link carries byte offsets plus its raw text, so `rewriteWikilinks` swaps only the target and the alias/heading survive byte-for-byte. Never add a regex link parser alongside this.
+- `src/lint-candidates.ts` — pure classification: `buildVaultIndex`, `resolveTarget` (Obsidian semantics: vault-rooted path, then basename anywhere), `basenameSimilarity`, `suggestTarget`, `classifyLink`, `summarize`. Class order is load-bearing — resolve → `planned` (`<!-- intentional -->` on the line) → `external` (exists in another vault) → `renamed-candidate` → `broken`. A similarity tie is reported as `broken` with `ambiguous`, never guessed.
+- `src/refactor.ts` — shared internals for the five refactor tools: `loadNotes`, `buildIndex`, `findBacklinks`, `preferredTarget` (bare basename unless ambiguous — Obsidian's shortest-unique convention), `normalizeMapping` (keys match a link target's **basename**, exact — never substring), `planRewrites`/`applyRewrites` (so a dry run and a real run compute the same diff). `log.md` and `references/` are excluded from the link graph.
+- `src/rollback.ts` — `createJournal()`, the per-file undo journal behind `move`/`bulk_move`/`rewrite_links` atomicity. Record a path *before* mutating it; `rollback()` restores captured bytes or unlinks a file that didn't exist. Deliberately not git-based: both live vaults share one repo and normally carry uncommitted Obsidian edits, so `reset --hard`/`stash` would revert work the server never wrote.
+- `src/tools/*.ts` — one file per tool, each exporting `register<Name>(server, registry, vaultFolders?)`, called from `server.ts`. Tool schemas use `zod/v3` (the SDK's `registerTool` expects v3-shaped schemas even though the project may have zod 4 available transitively). Tools return `{ content: [...], isError?: true, structuredContent?: {...} }`; errors from `resolveVault` are caught per-tool and surfaced as `isError: true` text rather than thrown.
+- Multi-vault dispatch pattern, consistent across tools: `save`/`save_reference`/`read`/`update`/`create_folder`/`find_backlinks`/`rewrite_links`/`move`/`bulk_move` take an optional `vault` arg, defaulting to `registry.defaultName` via `resolveVault`. `search`/`list`/`lint_links` instead default to iterating every vault in `registry.vaults` (results labeled `[vaultname]`) and only scope to one when `vault` is explicitly passed. `lint_links` indexes *every* configured vault on each call even when scoped, because `external` classification is exactly the question "does another vault have this note".
+- Every mutating refactor tool takes `dry_run` (default false), computed through the same code path as the real run. `move`/`bulk_move` apply `assertKnownTopLevelFolder` to the destination's `posix.dirname` — passing the whole file path would reject every root-level note. `references/` and `log.md` cannot be moved.
+- Frontmatter is read/written with `gray-matter` (`matter()` / `matter.stringify()`) everywhere notes are touched — `save` generates `{ title, created, updated, status: "draft", verified?, stale_when?, tags?, sources? }`; `update` preserves existing frontmatter fields and only bumps `updated`, with `sources` the one exception: it merges rather than clobbers, because provenance accumulates over a note's life. `save` has no content-based folder inference — a note is written to the vault root unless `folder` is given explicitly.
+- `sources` (optional on `save` and `update`) is `Array<{ resource, id?, title?, author?, last_modified? }>` — provenance for the material a note was written from. No `usage_count`/`usage_window`: there's no telemetry source for them here.
+- `save_reference` writes raw source material verbatim to `references/<path>` — no frontmatter, no kebab-casing, no duplicate check, content byte-for-byte as given. References are immutable **structurally**: there is no `update_reference` tool, and `save_reference` refuses to write over an existing path, so the tool surface offers no edit path at all (same pattern as the deliberate absence of delete/move). `references/` is created on demand and deliberately skips `assertKnownTopLevelFolder` — that guard exists to stop a *model-supplied* top-level segment from inventing folders, and here the segment is a constant owned by the tool. After the first reference is written the folder physically exists, so the filesystem-derived folder lists pick it up on the next server start with no allowlist to maintain.
+- `save` and `create_folder` reject a target path whose first segment isn't an existing top-level folder in that vault, naming the vault and listing its valid top-level folders in the error. This only gates the *top-level* segment — nesting further under an already-known top-level folder (e.g. `concepts/react/hooks` when `concepts` exists) is always allowed and creates intermediate folders as needed. Pass `allowNewTopLevel: true` to explicitly opt into creating a brand-new top-level folder.
+- `save` also rejects titles containing Cyrillic characters, and unless `force: true` is passed it scans the vault for filename/content matches on the title's words and returns those instead of creating the note (short-circuiting the write, before the top-level-folder check ever runs). That scan skips `log.md` unconditionally — the log accumulates every title ever written, so left in it eventually matches any new title.
+- Tests (`src/*.test.ts`) mix pure unit tests of `text.ts`/`paths.ts` helpers with integration tests that spin up a real `createServer` over `InMemoryTransport` against a `mkdtemp`-created scratch vault (see the top of `src/index.test.ts`) — prefer that pattern (in-memory client/server pair + temp dir) over mocking the filesystem when adding tool tests. Write-path tests (`src/history.test.ts`) run real git against the temp vault rather than mocking `child_process`; `git init` the temp vault in `beforeEach` **and set a local `user.email`/`user.name`**, otherwise commits depend on the machine's global git identity. `src/history.test.ts` also covers the enclosing-repo case by creating one repo with two vault directories inside it. Because `log.md` is opt-in, a test asserting log content must build a registry with `logEnabled: new Set([...])` — `history.test.ts`'s `connect` helper takes `{ log: true }`. `src/refactor.test.ts` forces a real mid-batch `bulk_move` failure by chmod-ing a destination directory to `0o500` rather than mocking, so the rollback journal is genuinely exercised.

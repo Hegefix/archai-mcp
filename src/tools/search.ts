@@ -1,7 +1,8 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v3";
 import matter from "gray-matter";
-import { resolveVaultPath, getAllMarkdownFiles, readNoteOrNull } from "../paths.js";
+import { readFile } from "node:fs/promises";
+import { resolveVaultPath, getAllMarkdownFiles } from "../paths.js";
 import { type VaultRegistry, resolveVault } from "../vaults.js";
 import { findWordPositions, extractBestSnippet } from "../text.js";
 
@@ -23,8 +24,7 @@ async function searchVault(
 
   for (const filePath of files) {
     const fullPath = resolveVaultPath(vaultPath, filePath);
-    const fileContent = await readNoteOrNull(fullPath);
-    if (fileContent === null) continue;
+    const fileContent = await readFile(fullPath, "utf-8");
     const parsed = matter(fileContent);
     const noteTitle =
       (parsed.data["title"] as string | undefined) ??

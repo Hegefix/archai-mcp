@@ -1,0 +1,10 @@
+{
+  "default": "tech",
+  "vaults": {
+    "tech": "../archai/tech",
+    "work": { "path": "../archai/work", "log": true },
+    "psychology": "../archai/psychology",
+    "absolute": "/absolute/path/to/a/vault",
+    "home": "~/Documents/some-vault"
+  }
+}

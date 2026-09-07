@@ -3,8 +3,18 @@ import { z } from "zod/v3";
 import { readFile } from "node:fs/promises";
 import { resolveVaultPath } from "../paths.js";
 import { type VaultRegistry, resolveVault } from "../vaults.js";
+import { describeVaultLayouts, firstTopLevelFolder, type VaultFolderInfo } from "../text.js";
 
-export function registerRead(server: McpServer, registry: VaultRegistry): void {
+export function registerRead(
+  server: McpServer,
+  registry: VaultRegistry,
+  vaultFolders: VaultFolderInfo[]
+): void {
+  const defaultVault = vaultFolders.find((v) => v.name === registry.defaultName);
+  const layoutSummary = describeVaultLayouts(vaultFolders);
+  const folder = firstTopLevelFolder(defaultVault);
+  const pathExample = folder ? `${folder}/example-note.md` : "example-note.md";
+
   server.registerTool(
     "read",
     {
@@ -13,7 +23,7 @@ export function registerRead(server: McpServer, registry: VaultRegistry): void {
         path: z
           .string()
           .describe(
-            'Relative path to the note, e.g. "public/tech/react-native-fabric.md"'
+            `Relative path to the note, e.g. "${pathExample}". Known top-level folders — ${layoutSummary}.`
           ),
         vault: z
           .string()

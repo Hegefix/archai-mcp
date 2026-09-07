@@ -1,459 +1,685 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { mkdtemp, rm, writeFile, readFile, mkdir, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdtemp, mkdir, rm, readFile, writeFile, stat, chmod } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { createServer } from "./server.js";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createServer, validateBatch, checkMovable, titleDivergence } from "./index.js";
 
-const execFileP = promisify(execFile);
-
-async function git(cwd: string, ...args: string[]): Promise<string> {
-  const { stdout } = await execFileP("git", args, { cwd });
-  return stdout;
-}
-
-async function initGitInVault(vault: string): Promise<void> {
-  await git(vault, "init");
-  await git(vault, "config", "user.email", "test@archai.local");
-  await git(vault, "config", "user.name", "Archai Test");
-  await git(vault, "config", "commit.gpgsign", "false");
-}
-
-async function gitAddCommit(vault: string, message: string): Promise<void> {
-  await git(vault, "add", "-A");
-  await git(vault, "commit", "-m", message);
-}
-
-async function gitLogCount(vault: string): Promise<number> {
-  const out = await git(vault, "rev-list", "--count", "HEAD");
-  return parseInt(out.trim(), 10);
-}
-
-async function gitLatestMessage(vault: string): Promise<string> {
-  return (await git(vault, "log", "-1", "--pretty=%s")).trim();
-}
-
-async function callTool(
-  client: Client,
-  name: string,
-  args: Record<string, unknown> = {}
-) {
-  return client.callTool({ name, arguments: args });
-}
+const run = promisify(execFile);
 
 function getText(result: Awaited<ReturnType<Client["callTool"]>>): string {
   const block = result.content as Array<{ type: string; text: string }>;
   return block[0]?.text ?? "";
 }
 
-async function setupVault(): Promise<{ vault: string; client: Client; close: () => Promise<void> }> {
-  const vault = await mkdtemp(join(tmpdir(), "archai-refactor-test-"));
-  const server = createServer(vault);
+function structured(result: Awaited<ReturnType<Client["callTool"]>>): Record<string, any> {
+  return (result.structuredContent ?? {}) as Record<string, any>;
+}
+
+async function git(cwd: string, args: string[]): Promise<string> {
+  const { stdout } = await run("git", args, { cwd });
+  return stdout.trim();
+}
+
+async function initRepo(dir: string): Promise<void> {
+  await git(dir, ["init"]);
+  await git(dir, ["config", "user.email", "test@example.com"]);
+  await git(dir, ["config", "user.name", "archai test"]);
+}
+
+async function connect(input: unknown): Promise<Client> {
+  const server = await createServer(input as string);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
   const client = new Client({ name: "test-client", version: "1.0.0" });
   await client.connect(clientTransport);
-  return {
-    vault,
-    client,
-    close: async () => {
-      await client.close();
-      await rm(vault, { recursive: true, force: true });
-    },
-  };
+  return client;
 }
 
-async function writeNote(vault: string, relPath: string, body: string): Promise<void> {
-  const full = join(vault, relPath);
-  await mkdir(join(full, ".."), { recursive: true });
-  await writeFile(full, body, "utf-8");
-}
+// --- Pure unit tests ---
 
-describe("find_backlinks", () => {
-  let vault: string;
-  let client: Client;
-  let close: () => Promise<void>;
-
-  beforeEach(async () => {
-    ({ vault, client, close } = await setupVault());
+describe("checkMovable", () => {
+  it("refuses to move the vault's log.md", () => {
+    expect(checkMovable("log.md", "notes/log.md")).toMatchObject({ ok: false });
   });
 
-  afterEach(async () => {
-    await close();
+  it("refuses to move a file out of references/", () => {
+    const result = checkMovable("references/rfc/spec.txt", "notes/spec.txt");
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) expect(result.error).toContain("references are immutable");
   });
 
-  it("finds wikilink backlinks across the vault", async () => {
-    await writeNote(vault, "a.md", "see [[target]] here");
-    await writeNote(vault, "b.md", "also [[target]]");
-    await writeNote(vault, "c.md", "nothing relevant");
-    await writeNote(vault, "target.md", "# target");
-
-    const r = await callTool(client, "find_backlinks", { target: "target" });
-    const sc = r.structuredContent as {
-      target: string;
-      resolved_files: string[];
-      backlinks: Array<{ path: string; link_type: string; raw: string }>;
-    };
-    expect(sc.target).toBe("target");
-    expect(sc.resolved_files).toEqual(["target.md"]);
-    expect(sc.backlinks).toHaveLength(2);
-    expect(sc.backlinks.map((b) => b.path).sort()).toEqual(["a.md", "b.md"]);
-    expect(sc.backlinks.every((b) => b.link_type === "wikilink")).toBe(true);
+  it("refuses to move a file into references/", () => {
+    expect(checkMovable("notes/a.md", "references/a.md")).toMatchObject({ ok: false });
   });
 
-  it("accepts a path as target and collapses to basename", async () => {
-    await writeNote(vault, "public/tech/target.md", "# t");
-    await writeNote(vault, "other.md", "see [[target]]");
-    const r = await callTool(client, "find_backlinks", {
-      target: "public/tech/target.md",
-    });
-    const sc = r.structuredContent as { target: string; backlinks: unknown[] };
-    expect(sc.target).toBe("target");
-    expect(sc.backlinks).toHaveLength(1);
+  it("refuses a no-op move", () => {
+    expect(checkMovable("a.md", "a.md")).toMatchObject({ ok: false });
   });
 
-  it("excludes wikilinks inside code blocks", async () => {
-    await writeNote(vault, "a.md", "real [[target]]\n\n```\n[[target]]\n```\nand `[[target]]`");
-    await writeNote(vault, "target.md", "");
-    const r = await callTool(client, "find_backlinks", { target: "target" });
-    const sc = r.structuredContent as { backlinks: unknown[] };
-    expect(sc.backlinks).toHaveLength(1);
-  });
-
-  it("preserves alias in raw backlink text", async () => {
-    await writeNote(vault, "a.md", "click [[target|display name]]");
-    await writeNote(vault, "target.md", "");
-    const r = await callTool(client, "find_backlinks", { target: "target" });
-    const sc = r.structuredContent as { backlinks: Array<{ raw: string }> };
-    expect(sc.backlinks[0]!.raw).toBe("[[target|display name]]");
-  });
-
-  it("detects markdown-style links to the target", async () => {
-    await writeNote(vault, "a.md", "click [here](./target.md)");
-    await writeNote(vault, "target.md", "");
-    const r = await callTool(client, "find_backlinks", { target: "target" });
-    const sc = r.structuredContent as {
-      backlinks: Array<{ link_type: string; raw: string }>;
-    };
-    expect(sc.backlinks).toHaveLength(1);
-    expect(sc.backlinks[0]!.link_type).toBe("markdown");
-    expect(sc.backlinks[0]!.raw).toBe("[here](./target.md)");
-  });
-
-  it("returns empty backlinks and resolved_files for unknown target", async () => {
-    await writeNote(vault, "a.md", "see [[other]]");
-    const r = await callTool(client, "find_backlinks", { target: "missing" });
-    const sc = r.structuredContent as {
-      resolved_files: string[];
-      backlinks: unknown[];
-    };
-    expect(sc.resolved_files).toEqual([]);
-    expect(sc.backlinks).toEqual([]);
-  });
-
-  it("reports ambiguity when multiple files share the basename", async () => {
-    await writeNote(vault, "public/note.md", "");
-    await writeNote(vault, "private/note.md", "");
-    await writeNote(vault, "ref.md", "see [[note]]");
-    const r = await callTool(client, "find_backlinks", { target: "note" });
-    const sc = r.structuredContent as { resolved_files: string[] };
-    expect(sc.resolved_files.sort()).toEqual([
-      "private/note.md",
-      "public/note.md",
-    ]);
-    expect(getText(r)).toContain("Ambiguous");
-  });
-
-  it("includes self-references", async () => {
-    await writeNote(vault, "target.md", "see [[target]] (self)");
-    const r = await callTool(client, "find_backlinks", { target: "target" });
-    const sc = r.structuredContent as { backlinks: Array<{ path: string }> };
-    expect(sc.backlinks).toHaveLength(1);
-    expect(sc.backlinks[0]!.path).toBe("target.md");
+  it("allows an ordinary rename", () => {
+    expect(checkMovable("notes/a.md", "notes/b.md")).toEqual({ ok: true });
   });
 });
 
-describe("move", () => {
-  let vault: string;
+describe("titleDivergence", () => {
+  it("stays quiet when the title matches the filename", () => {
+    const note = "---\ntitle: React Query\n---\nbody\n";
+    expect(titleDivergence(note, "concepts/react-query.md")).toBeUndefined();
+  });
+
+  // The live case: work/mobile/stack-state.md is titled "GoodHabitz Mobile Stack
+  // State". Titles and filenames are decoupled on purpose, so this is a note, not
+  // an error, and never an automatic rewrite.
+  it("reports a divergence for the caller to judge", () => {
+    const note = "---\ntitle: GoodHabitz Mobile Stack State\n---\nbody\n";
+    const message = titleDivergence(note, "mobile/stack-state.md");
+    expect(message).toContain("GoodHabitz Mobile Stack State");
+    expect(message).toContain("not rewritten");
+  });
+
+  it("stays quiet for a note with no title", () => {
+    expect(titleDivergence("no frontmatter here\n", "a.md")).toBeUndefined();
+  });
+});
+
+describe("validateBatch", () => {
+  const existing = new Set(["a.md", "b.md", "c.md"]);
+
+  it("accepts a clean batch", () => {
+    const result = validateBatch([{ from: "a.md", to: "x.md" }], existing);
+    expect(result.ok).toBe(true);
+  });
+
+  it("rejects an empty batch", () => {
+    expect(validateBatch([], existing)).toMatchObject({ ok: false });
+  });
+
+  it("rejects a missing source, naming the entry", () => {
+    const result = validateBatch(
+      [{ from: "a.md", to: "x.md" }, { from: "gone.md", to: "y.md" }],
+      existing
+    );
+    expect(result).toMatchObject({ ok: false, index: 1 });
+  });
+
+  it("rejects two moves targeting the same path", () => {
+    const result = validateBatch(
+      [{ from: "a.md", to: "x.md" }, { from: "b.md", to: "x.md" }],
+      existing
+    );
+    expect(result).toMatchObject({ ok: false, index: 1 });
+    if (!result.ok) expect(result.error).toContain("two moves target");
+  });
+
+  it("rejects moving the same source twice", () => {
+    const result = validateBatch(
+      [{ from: "a.md", to: "x.md" }, { from: "a.md", to: "y.md" }],
+      existing
+    );
+    if (!result.ok) expect(result.error).toContain("moved more than once");
+  });
+
+  it("rejects a destination that would overwrite a note staying put", () => {
+    const result = validateBatch([{ from: "a.md", to: "c.md" }], existing);
+    if (!result.ok) expect(result.error).toContain("not being moved out of the way");
+  });
+
+  it("allows a destination whose occupant is moving out in the same batch", () => {
+    const result = validateBatch(
+      [{ from: "a.md", to: "c.md" }, { from: "c.md", to: "z.md" }],
+      existing
+    );
+    expect(result.ok).toBe(true);
+  });
+
+  it("orders a chain so the destination is vacated first", () => {
+    const result = validateBatch(
+      [{ from: "a.md", to: "c.md" }, { from: "c.md", to: "z.md" }],
+      existing
+    );
+    if (result.ok) expect(result.ordered.map((e) => e.from)).toEqual(["c.md", "a.md"]);
+  });
+
+  it("rejects a cycle rather than inventing a temporary name", () => {
+    const result = validateBatch(
+      [{ from: "a.md", to: "b.md" }, { from: "b.md", to: "a.md" }],
+      existing
+    );
+    expect(result).toMatchObject({ ok: false });
+    if (!result.ok) expect(result.error).toContain("cycle");
+  });
+
+  it("rejects two sources sharing a basename, which links cannot disambiguate", () => {
+    const result = validateBatch(
+      [{ from: "one/dup.md", to: "one/x.md" }, { from: "two/dup.md", to: "two/y.md" }],
+      new Set(["one/dup.md", "two/dup.md"])
+    );
+    expect(result).toMatchObject({ ok: false, index: 1 });
+    if (!result.ok) expect(result.error).toContain("share the basename");
+  });
+});
+
+// --- Integration tests over a real server ---
+
+describe("refactor tools", () => {
+  let vaultPath: string;
   let client: Client;
-  let close: () => Promise<void>;
 
   beforeEach(async () => {
-    ({ vault, client, close } = await setupVault());
-  });
+    vaultPath = await mkdtemp(join(tmpdir(), "archai-refactor-"));
+    await mkdir(join(vaultPath, "concepts"), { recursive: true });
+    await mkdir(join(vaultPath, "notes"), { recursive: true });
+    await initRepo(vaultPath);
 
-  afterEach(async () => {
-    await close();
-  });
-
-  it("renames within the same folder (basename unchanged): no link updates needed", async () => {
-    await writeNote(vault, "public/a.md", "see [[b]]");
-    await writeNote(vault, "public/b.md", "body");
-    const r = await callTool(client, "move", {
-      from: "public/b.md",
-      to: "public/sub/b.md",
-    });
-    const sc = r.structuredContent as {
-      moved: boolean;
-      link_updates: unknown[];
-    };
-    expect(sc.moved).toBe(true);
-    expect(sc.link_updates).toEqual([]);
-    const a = await readFile(join(vault, "public/a.md"), "utf-8");
-    expect(a).toBe("see [[b]]"); // wikilinks resolve by basename, no change needed
-    await expect(stat(join(vault, "public/b.md"))).rejects.toThrow();
-    await expect(stat(join(vault, "public/sub/b.md"))).resolves.toBeDefined();
-  });
-
-  it("rewrites wikilinks in backlink files when basename changes", async () => {
-    await writeNote(vault, "a.md", "see [[old]] and also [[old|alias]]");
-    await writeNote(vault, "b.md", "ref to [[old#heading]]");
-    await writeNote(vault, "old.md", "body");
-
-    const r = await callTool(client, "move", {
-      from: "old.md",
-      to: "new.md",
-    });
-    const sc = r.structuredContent as {
-      link_updates: Array<{ path: string; old: string; new: string }>;
-    };
-    expect(sc.link_updates).toHaveLength(3);
-    const a = await readFile(join(vault, "a.md"), "utf-8");
-    expect(a).toBe("see [[new]] and also [[new|alias]]");
-    const b = await readFile(join(vault, "b.md"), "utf-8");
-    expect(b).toBe("ref to [[new#heading]]");
-  });
-
-  it("rewrites markdown-style links pointing at the old path", async () => {
-    await writeNote(vault, "a.md", "click [link](./old.md)");
-    await writeNote(vault, "old.md", "body");
-
-    const r = await callTool(client, "move", {
-      from: "old.md",
-      to: "new.md",
-    });
-    const sc = r.structuredContent as { link_updates: unknown[] };
-    expect(sc.link_updates).toHaveLength(1);
-    const a = await readFile(join(vault, "a.md"), "utf-8");
-    expect(a).toBe("click [link](new.md)");
-  });
-
-  it("recomputes outgoing markdown links inside the moved note", async () => {
-    await writeNote(vault, "public/scratch/a.md", "see [other](./b.md)");
-    await writeNote(vault, "public/scratch/b.md", "body");
-
-    const r = await callTool(client, "move", {
-      from: "public/scratch/a.md",
-      to: "public/concepts/a.md",
-    });
-    expect((r.structuredContent as { moved: boolean }).moved).toBe(true);
-    const moved = await readFile(
-      join(vault, "public/concepts/a.md"),
+    await writeFile(
+      join(vaultPath, "concepts/target.md"),
+      "---\ntitle: Target\n---\nthe target note\n",
       "utf-8"
     );
-    expect(moved).toContain("(../scratch/b.md)");
-  });
-
-  it("refuses when destination basename collides without allow_ambiguity", async () => {
-    await writeNote(vault, "private/note.md", "private one");
-    await writeNote(vault, "public/note.md", "public one");
-    await writeNote(vault, "old.md", "to move");
-
-    const r = await callTool(client, "move", {
-      from: "old.md",
-      to: "archive/note.md",
-    });
-    expect(r.isError).toBe(true);
-    expect(getText(r)).toContain("already used by");
-    await expect(stat(join(vault, "old.md"))).resolves.toBeDefined();
-  });
-
-  it("proceeds with warning when allow_ambiguity is true", async () => {
-    await writeNote(vault, "private/note.md", "private one");
-    await writeNote(vault, "old.md", "to move");
-    const r = await callTool(client, "move", {
-      from: "old.md",
-      to: "archive/note.md",
-      allow_ambiguity: true,
-    });
-    const sc = r.structuredContent as { warnings: string[]; moved: boolean };
-    expect(sc.moved).toBe(true);
-    expect(sc.warnings.length).toBeGreaterThan(0);
-  });
-
-  it("refuses when destination exists without overwrite", async () => {
-    await writeNote(vault, "a.md", "one");
-    await writeNote(vault, "b.md", "two");
-    const r = await callTool(client, "move", { from: "a.md", to: "b.md" });
-    expect(r.isError).toBe(true);
-    expect(getText(r)).toContain("already exists");
-  });
-
-  it("overwrites when overwrite=true", async () => {
-    await writeNote(vault, "a.md", "from-content");
-    await writeNote(vault, "b.md", "to-content");
-    const r = await callTool(client, "move", {
-      from: "a.md",
-      to: "b.md",
-      overwrite: true,
-    });
-    const sc = r.structuredContent as { moved: boolean };
-    expect(sc.moved).toBe(true);
-    const b = await readFile(join(vault, "b.md"), "utf-8");
-    expect(b).toBe("from-content");
-  });
-
-  it("is a no-op when from === to", async () => {
-    await writeNote(vault, "x.md", "body");
-    const r = await callTool(client, "move", { from: "x.md", to: "x.md" });
-    const sc = r.structuredContent as { moved: boolean };
-    expect(sc.moved).toBe(false);
-    await expect(stat(join(vault, "x.md"))).resolves.toBeDefined();
-  });
-
-  it("dry_run returns the plan without writing", async () => {
-    await writeNote(vault, "a.md", "see [[old]]");
-    await writeNote(vault, "old.md", "body");
-    const r = await callTool(client, "move", {
-      from: "old.md",
-      to: "new.md",
-      dry_run: true,
-    });
-    const sc = r.structuredContent as {
-      moved: boolean;
-      link_updates: unknown[];
-      dry_run: boolean;
-    };
-    expect(sc.dry_run).toBe(true);
-    expect(sc.moved).toBe(false);
-    expect(sc.link_updates).toHaveLength(1);
-    await expect(stat(join(vault, "old.md"))).resolves.toBeDefined();
-    await expect(stat(join(vault, "new.md"))).rejects.toThrow();
-  });
-
-  it("errors when from doesn't exist", async () => {
-    const r = await callTool(client, "move", {
-      from: "missing.md",
-      to: "elsewhere.md",
-    });
-    expect(r.isError).toBe(true);
-    expect(getText(r)).toContain("not found");
-  });
-
-  it("errors when paths don't end in .md", async () => {
-    await writeNote(vault, "x.md", "");
-    const r = await callTool(client, "move", { from: "x.md", to: "y.txt" });
-    expect(r.isError).toBe(true);
-    expect(getText(r)).toContain("must end in .md");
-  });
-
-  it("bumps frontmatter `updated` on the moved note only", async () => {
-    const today = new Date().toISOString().split("T")[0];
-    await writeNote(
-      vault,
-      "old.md",
-      "---\ntitle: T\nupdated: 2020-01-01\n---\nbody"
+    await writeFile(
+      join(vaultPath, "notes/citer.md"),
+      [
+        "---",
+        "title: Citer",
+        "---",
+        "bare [[target]]",
+        "prefixed [[concepts/target]]",
+        "aliased [[target|The Target]]",
+        "anchored [[target#Some Heading]]",
+        "in code `[[target]]`",
+        "```",
+        "[[target]]",
+        "```",
+        "",
+      ].join("\n"),
+      "utf-8"
     );
-    await writeNote(
-      vault,
-      "ref.md",
-      "---\ntitle: R\nupdated: 2020-01-01\n---\nsee [[old]]"
+    await writeFile(
+      join(vaultPath, "notes/other.md"),
+      "---\ntitle: Other\n---\nnothing relevant here\n",
+      "utf-8"
     );
-    await callTool(client, "move", { from: "old.md", to: "new.md" });
-    const moved = await readFile(join(vault, "new.md"), "utf-8");
-    // YAML may quote the value; both forms encode the same date.
-    expect(moved).toMatch(new RegExp(`updated:\\s*['"]?${today}['"]?`));
-    const ref = await readFile(join(vault, "ref.md"), "utf-8");
-    expect(ref).toContain("updated: 2020-01-01");
-    expect(ref).toContain("[[new]]");
-  });
 
-  it("rewrites self-referential markdown link inside the moved note", async () => {
-    await writeNote(vault, "old.md", "[me](./old.md) and body");
-    await callTool(client, "move", { from: "old.md", to: "new.md" });
-    const moved = await readFile(join(vault, "new.md"), "utf-8");
-    expect(moved).toContain("(new.md)");
-    expect(moved).not.toContain("(./old.md)");
-    expect(moved).not.toContain("(old.md)");
-  });
-
-  it("update_links=false skips backlink updates", async () => {
-    await writeNote(vault, "a.md", "see [[old]]");
-    await writeNote(vault, "old.md", "body");
-    const r = await callTool(client, "move", {
-      from: "old.md",
-      to: "new.md",
-      update_links: false,
-    });
-    const sc = r.structuredContent as { link_updates: unknown[] };
-    expect(sc.link_updates).toEqual([]);
-    const a = await readFile(join(vault, "a.md"), "utf-8");
-    expect(a).toBe("see [[old]]");
-  });
-});
-
-describe("rewrite_links", () => {
-  let vault: string;
-  let client: Client;
-  let close: () => Promise<void>;
-
-  beforeEach(async () => {
-    ({ vault, client, close } = await setupVault());
+    await git(vaultPath, ["add", "-A"]);
+    await git(vaultPath, ["commit", "-m", "base"]);
+    client = await connect(vaultPath);
   });
 
   afterEach(async () => {
-    await close();
+    await client.close();
+    await rm(vaultPath, { recursive: true, force: true });
   });
 
-  it("rewrites wikilinks across multiple files preserving aliases and headings", async () => {
-    await writeNote(vault, "a.md", "see [[old]] and [[old|alt]] and [[old#H]]");
-    await writeNote(vault, "b.md", "and embed ![[old]]");
+  const call = (name: string, args: Record<string, unknown> = {}) =>
+    client.callTool({ name, arguments: args });
 
-    const r = await callTool(client, "rewrite_links", {
-      from: "old",
-      to: "new",
+  const read = (relative: string) => readFile(join(vaultPath, relative), "utf-8");
+
+  describe("find_backlinks", () => {
+    it("finds every link shape pointing at a note, and no code-block ones", async () => {
+      const result = await call("find_backlinks", { path: "concepts/target.md" });
+      const data = structured(result);
+      expect(data["count"]).toBe(4);
+      expect(data["files"]).toBe(1);
+      expect(data["backlinks"].map((b: any) => b.raw)).toEqual([
+        "[[target]]",
+        "[[concepts/target]]",
+        "[[target|The Target]]",
+        "[[target#Some Heading]]",
+      ]);
     });
-    const sc = r.structuredContent as { updates: unknown[] };
-    expect(sc.updates).toHaveLength(4);
 
-    const a = await readFile(join(vault, "a.md"), "utf-8");
-    expect(a).toBe("see [[new]] and [[new|alt]] and [[new#H]]");
-    const b = await readFile(join(vault, "b.md"), "utf-8");
-    expect(b).toBe("and embed ![[new]]");
-  });
-
-  it("rewrites markdown-style links whose basename matches", async () => {
-    await writeNote(vault, "a.md", "click [x](./old.md) or [y](sub/old.md)");
-    const r = await callTool(client, "rewrite_links", {
-      from: "old",
-      to: "new",
+    it("reports line numbers", async () => {
+      const data = structured(await call("find_backlinks", { path: "concepts/target.md" }));
+      expect(data["backlinks"].map((b: any) => b.line)).toEqual([4, 5, 6, 7]);
     });
-    expect((r.structuredContent as { updates: unknown[] }).updates).toHaveLength(2);
-    const a = await readFile(join(vault, "a.md"), "utf-8");
-    expect(a).toBe("click [x](new.md) or [y](sub/new.md)");
-  });
 
-  it("dry_run does not write", async () => {
-    await writeNote(vault, "a.md", "see [[old]]");
-    const r = await callTool(client, "rewrite_links", {
-      from: "old",
-      to: "new",
-      dry_run: true,
+    it("accepts a bare basename", async () => {
+      const data = structured(await call("find_backlinks", { path: "target" }));
+      expect(data["count"]).toBe(4);
     });
-    const sc = r.structuredContent as { updates: unknown[]; dry_run: boolean };
-    expect(sc.dry_run).toBe(true);
-    expect(sc.updates).toHaveLength(1);
-    const a = await readFile(join(vault, "a.md"), "utf-8");
-    expect(a).toBe("see [[old]]");
+
+    it("returns nothing for a note nobody links to", async () => {
+      const data = structured(await call("find_backlinks", { path: "notes/other.md" }));
+      expect(data["count"]).toBe(0);
+    });
+
+    it("errors on a note that isn't there", async () => {
+      const result = await call("find_backlinks", { path: "no-such-note.md" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("no note matching");
+    });
   });
 
-  it("leaves wikilinks inside code blocks alone", async () => {
-    await writeNote(vault, "a.md", "real [[old]] code `[[old]]`");
-    await callTool(client, "rewrite_links", { from: "old", to: "new" });
-    const a = await readFile(join(vault, "a.md"), "utf-8");
-    expect(a).toBe("real [[new]] code `[[old]]`");
+  describe("lint_links", () => {
+    it("reports a machine-readable summary with every class counted", async () => {
+      const summary = structured(await call("lint_links", {}))["summary"];
+      expect(summary).toMatchObject({
+        total: 4,
+        ok: 4,
+        planned: 0,
+        external: 0,
+        "renamed-candidate": 0,
+        broken: 0,
+        failures: 0,
+        healthy: true,
+      });
+    });
+
+    it("does not count links inside inline or fenced code", async () => {
+      // citer.md has six [[target]] occurrences; two are code and must not appear.
+      const summary = structured(await call("lint_links", {}))["summary"];
+      expect(summary["total"]).toBe(4);
+    });
+
+    it("classifies a dangling link as broken and marks the vault unhealthy", async () => {
+      await writeFile(join(vaultPath, "notes/broken.md"), "[[nothing-like-this]]\n", "utf-8");
+      const summary = structured(await call("lint_links", {}))["summary"];
+      expect(summary).toMatchObject({ broken: 1, failures: 1, healthy: false });
+    });
+
+    it("classifies a marked dangling link as planned, not a failure", async () => {
+      await writeFile(
+        join(vaultPath, "notes/planned.md"),
+        "- [[not-written-yet]] <!-- intentional -->\n",
+        "utf-8"
+      );
+      const summary = structured(await call("lint_links", {}))["summary"];
+      expect(summary).toMatchObject({ planned: 1, broken: 0, failures: 0, healthy: true });
+    });
+
+    it("suggests a target for a near-miss link", async () => {
+      await writeFile(join(vaultPath, "notes/typo.md"), "[[concepts/targett]]\n", "utf-8");
+      const data = structured(await call("lint_links", {}));
+      expect(data["summary"]).toMatchObject({ "renamed-candidate": 1 });
+      const finding = data["findings"].find((f: any) => f.class === "renamed-candidate");
+      expect(finding).toMatchObject({ suggestion: "concepts/target" });
+    });
+  });
+
+  describe("rewrite_links", () => {
+    it("preserves aliases and headings while retargeting", async () => {
+      await call("rewrite_links", { mapping: { target: "renamed" } });
+      const citer = await read("notes/citer.md");
+      expect(citer).toContain("bare [[renamed]]");
+      expect(citer).toContain("prefixed [[renamed]]");
+      expect(citer).toContain("aliased [[renamed|The Target]]");
+      expect(citer).toContain("anchored [[renamed#Some Heading]]");
+    });
+
+    it("leaves links in code alone", async () => {
+      await call("rewrite_links", { mapping: { target: "renamed" } });
+      const citer = await read("notes/citer.md");
+      expect(citer).toContain("in code `[[target]]`");
+      expect(citer).toContain("```\n[[target]]\n```");
+    });
+
+    it("writes nothing on a dry run but reports the diff", async () => {
+      const before = await read("notes/citer.md");
+      const result = await call("rewrite_links", {
+        mapping: { target: "renamed" },
+        dry_run: true,
+      });
+      expect(await read("notes/citer.md")).toBe(before);
+      expect(getText(result)).toContain("Dry run");
+      expect(structured(result)["dryRun"]).toBe(true);
+    });
+
+    it("reports the same diff a real run applies", async () => {
+      const dry = structured(
+        await call("rewrite_links", { mapping: { target: "renamed" }, dry_run: true })
+      );
+      const wet = structured(await call("rewrite_links", { mapping: { target: "renamed" } }));
+      expect(wet["rewrites"]).toEqual(dry["rewrites"]);
+    });
+
+    it("commits the rewrite as one commit", async () => {
+      const before = Number(await git(vaultPath, ["rev-list", "--count", "HEAD"]));
+      await call("rewrite_links", { mapping: { target: "renamed" } });
+      expect(Number(await git(vaultPath, ["rev-list", "--count", "HEAD"]))).toBe(before + 1);
+      expect(await git(vaultPath, ["log", "--format=%s", "-1"])).toContain("rewrite_links:");
+    });
+
+    it("reports when nothing matched", async () => {
+      const result = await call("rewrite_links", { mapping: { "no-such-note": "x" } });
+      expect(getText(result)).toContain("No links matched");
+    });
+
+    it("rejects an empty mapping", async () => {
+      const result = await call("rewrite_links", { mapping: {} });
+      expect(result.isError).toBe(true);
+    });
+  });
+
+  describe("move", () => {
+    it("renames the file and rewrites every inbound link", async () => {
+      const result = await call("move", {
+        from: "concepts/target.md",
+        to: "concepts/renamed.md",
+      });
+      expect(result.isError).toBeFalsy();
+      expect((await stat(join(vaultPath, "concepts/renamed.md"))).isFile()).toBe(true);
+      await expect(stat(join(vaultPath, "concepts/target.md"))).rejects.toThrow();
+
+      const citer = await read("notes/citer.md");
+      expect(citer).toContain("bare [[renamed]]");
+      expect(citer).toContain("aliased [[renamed|The Target]]");
+      expect(citer).toContain("anchored [[renamed#Some Heading]]");
+      expect(citer).toContain("in code `[[target]]`");
+      expect(structured(result)["links"]).toBe(4);
+    });
+
+    it("records the change as a rename in git history", async () => {
+      await call("move", { from: "concepts/target.md", to: "concepts/renamed.md" });
+      const status = await git(vaultPath, [
+        "show",
+        "--name-status",
+        "--format=",
+        "--find-renames",
+        "HEAD",
+      ]);
+      expect(status).toMatch(/^R/m);
+      expect(status).toContain("concepts/target.md");
+      expect(status).toContain("concepts/renamed.md");
+    });
+
+    it("lands the rename and its link rewrites in one commit", async () => {
+      const before = Number(await git(vaultPath, ["rev-list", "--count", "HEAD"]));
+      await call("move", { from: "concepts/target.md", to: "concepts/renamed.md" });
+      expect(Number(await git(vaultPath, ["rev-list", "--count", "HEAD"]))).toBe(before + 1);
+      expect(await git(vaultPath, ["log", "--format=%s", "-1"])).toBe(
+        "move: concepts/target.md -> concepts/renamed.md (+4 links in 1 files)"
+      );
+      expect(await git(vaultPath, ["status", "--porcelain"])).toBe("");
+    });
+
+    it("refuses to overwrite an existing target", async () => {
+      const result = await call("move", {
+        from: "concepts/target.md",
+        to: "notes/other.md",
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("already exists — refusing to overwrite");
+      // Neither file moved.
+      expect((await stat(join(vaultPath, "concepts/target.md"))).isFile()).toBe(true);
+      expect(await read("notes/other.md")).toContain("nothing relevant here");
+    });
+
+    it("rejects a path that climbs out of the vault, with the existing path-safety error", async () => {
+      const result = await call("move", { from: "../outside.md", to: "notes/x.md" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toBe("Error: Path traversal detected: ../outside.md");
+    });
+
+    it("rejects a destination that climbs out of the vault", async () => {
+      const result = await call("move", {
+        from: "concepts/target.md",
+        to: "../escaped.md",
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Path traversal detected");
+    });
+
+    it("rejects an absolute destination", async () => {
+      const result = await call("move", { from: "concepts/target.md", to: "/etc/x.md" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("must be relative to vault root");
+    });
+
+    it("refuses to move log.md", async () => {
+      await writeFile(join(vaultPath, "log.md"), "# Log\n", "utf-8");
+      const result = await call("move", { from: "log.md", to: "notes/log.md" });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("log.md");
+    });
+
+    it("refuses to move a note into references/", async () => {
+      const result = await call("move", {
+        from: "concepts/target.md",
+        to: "references/target.md",
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("references are immutable");
+    });
+
+    it("rejects an unknown top-level folder unless opted in", async () => {
+      const rejected = await call("move", { from: "concepts/target.md", to: "brand-new/t.md" });
+      expect(rejected.isError).toBe(true);
+      expect(getText(rejected)).toContain("Unknown top-level folder");
+
+      const allowed = await call("move", {
+        from: "concepts/target.md",
+        to: "brand-new/t.md",
+        allowNewTopLevel: true,
+      });
+      expect(allowed.isError).toBeFalsy();
+    });
+
+    it("moves into a folder given as the destination, keeping the filename", async () => {
+      const result = await call("move", { from: "concepts/target.md", to: "notes" });
+      expect(structured(result)["to"]).toBe("notes/target.md");
+    });
+
+    it("adds .md when the destination has no extension", async () => {
+      const result = await call("move", { from: "concepts/target.md", to: "notes/renamed" });
+      expect(structured(result)["to"]).toBe("notes/renamed.md");
+    });
+
+    it("notes a title that no longer matches the filename, without rewriting it", async () => {
+      const result = await call("move", {
+        from: "concepts/target.md",
+        to: "concepts/something-else.md",
+      });
+      expect(structured(result)["titleNote"]).toContain("Target");
+      expect(await read("concepts/something-else.md")).toContain("title: Target");
+    });
+
+    it("leaves links alone when update_links is false", async () => {
+      const before = await read("notes/citer.md");
+      await call("move", {
+        from: "concepts/target.md",
+        to: "concepts/renamed.md",
+        update_links: false,
+      });
+      expect(await read("notes/citer.md")).toBe(before);
+    });
+
+    it("writes nothing on a dry run", async () => {
+      const head = await git(vaultPath, ["rev-parse", "HEAD"]);
+      const result = await call("move", {
+        from: "concepts/target.md",
+        to: "concepts/renamed.md",
+        dry_run: true,
+      });
+      expect((await stat(join(vaultPath, "concepts/target.md"))).isFile()).toBe(true);
+      expect(structured(result)["links"]).toBe(4);
+      expect(await git(vaultPath, ["rev-parse", "HEAD"])).toBe(head);
+      expect(await git(vaultPath, ["status", "--porcelain"])).toBe("");
+    });
+
+    it("rewrites folder-prefixed links when only the folder changes", async () => {
+      await call("move", { from: "concepts/target.md", to: "notes/target.md" });
+      const citer = await read("notes/citer.md");
+      expect(citer).toContain("prefixed [[target]]");
+      expect(citer).toContain("bare [[target]]");
+    });
+  });
+
+  describe("bulk_move", () => {
+    it("applies a whole batch as one commit", async () => {
+      const before = Number(await git(vaultPath, ["rev-list", "--count", "HEAD"]));
+      const result = await call("bulk_move", {
+        moves: [
+          { from: "concepts/target.md", to: "concepts/renamed.md" },
+          { from: "notes/other.md", to: "notes/other-renamed.md" },
+        ],
+      });
+      expect(result.isError).toBeFalsy();
+      expect(Number(await git(vaultPath, ["rev-list", "--count", "HEAD"]))).toBe(before + 1);
+      expect(await git(vaultPath, ["log", "--format=%s", "-1"])).toContain("bulk_move: 2 notes");
+      expect(await read("notes/citer.md")).toContain("bare [[renamed]]");
+    });
+
+    it("writes nothing on a dry run", async () => {
+      const head = await git(vaultPath, ["rev-parse", "HEAD"]);
+      await call("bulk_move", {
+        moves: [{ from: "concepts/target.md", to: "concepts/renamed.md" }],
+        dry_run: true,
+      });
+      expect((await stat(join(vaultPath, "concepts/target.md"))).isFile()).toBe(true);
+      expect(await git(vaultPath, ["rev-parse", "HEAD"])).toBe(head);
+    });
+
+    it("rejects the whole batch when one entry collides, moving nothing", async () => {
+      const result = await call("bulk_move", {
+        moves: [
+          { from: "concepts/target.md", to: "concepts/renamed.md" },
+          { from: "notes/other.md", to: "notes/citer.md" },
+        ],
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("batch rejected (moves[1])");
+      expect((await stat(join(vaultPath, "concepts/target.md"))).isFile()).toBe(true);
+      expect(await git(vaultPath, ["status", "--porcelain"])).toBe("");
+    });
+
+    it("rolls the whole batch back when a move fails part way through", async () => {
+      // A read-only directory makes the second rename fail for real, after the
+      // first has already been applied — the exact half-applied state that must
+      // not survive.
+      const locked = join(vaultPath, "locked");
+      await mkdir(locked, { recursive: true });
+      await git(vaultPath, ["add", "-A"]);
+      await writeFile(join(locked, ".keep"), "", "utf-8");
+      await git(vaultPath, ["add", "-A"]);
+      await git(vaultPath, ["commit", "-m", "add locked"]);
+      await chmod(locked, 0o500);
+
+      try {
+        const head = await git(vaultPath, ["rev-parse", "HEAD"]);
+        const citerBefore = await read("notes/citer.md");
+
+        const result = await call("bulk_move", {
+          moves: [
+            { from: "concepts/target.md", to: "concepts/renamed.md" },
+            { from: "notes/other.md", to: "locked/other.md" },
+          ],
+        });
+
+        expect(result.isError).toBe(true);
+        expect(getText(result)).toContain("rolled back in full");
+        expect(structured(result)).toMatchObject({
+          rolledBack: true,
+          failedEntry: { from: "notes/other.md", to: "locked/other.md" },
+        });
+
+        // Nothing moved, no links rewritten, no commit.
+        expect((await stat(join(vaultPath, "concepts/target.md"))).isFile()).toBe(true);
+        expect((await stat(join(vaultPath, "notes/other.md"))).isFile()).toBe(true);
+        await expect(stat(join(vaultPath, "concepts/renamed.md"))).rejects.toThrow();
+        expect(await read("notes/citer.md")).toBe(citerBefore);
+        expect(await git(vaultPath, ["rev-parse", "HEAD"])).toBe(head);
+      } finally {
+        await chmod(locked, 0o700);
+      }
+    });
+
+    it("rejects a cycle", async () => {
+      const result = await call("bulk_move", {
+        moves: [
+          { from: "concepts/target.md", to: "notes/other.md" },
+          { from: "notes/other.md", to: "concepts/target.md" },
+        ],
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("cycle");
+    });
+
+    it("handles a chain by vacating the destination first", async () => {
+      const result = await call("bulk_move", {
+        moves: [
+          { from: "concepts/target.md", to: "notes/other.md" },
+          { from: "notes/other.md", to: "notes/moved-away.md" },
+        ],
+      });
+      expect(result.isError).toBeFalsy();
+      expect(await read("notes/other.md")).toContain("the target note");
+      expect(await read("notes/moved-away.md")).toContain("nothing relevant here");
+    });
+
+    it("rejects a path escape before touching anything", async () => {
+      const result = await call("bulk_move", {
+        moves: [{ from: "../outside.md", to: "notes/x.md" }],
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Path traversal detected");
+    });
+  });
+
+  describe("read-only tools stay read-only", () => {
+    it("neither find_backlinks nor lint_links commits or writes", async () => {
+      const head = await git(vaultPath, ["rev-parse", "HEAD"]);
+      await call("find_backlinks", { path: "concepts/target.md" });
+      await call("lint_links", {});
+      expect(await git(vaultPath, ["rev-parse", "HEAD"])).toBe(head);
+      expect(await git(vaultPath, ["status", "--porcelain"])).toBe("");
+    });
+  });
+});
+
+describe("lint_links across vaults", () => {
+  let repoRoot: string;
+  let client: Client;
+
+  beforeEach(async () => {
+    repoRoot = await mkdtemp(join(tmpdir(), "archai-crossvault-"));
+    await mkdir(join(repoRoot, "tech/concepts"), { recursive: true });
+    await mkdir(join(repoRoot, "work/mobile"), { recursive: true });
+    await initRepo(repoRoot);
+
+    await writeFile(join(repoRoot, "work/mobile/stack-state.md"), "state\n", "utf-8");
+    // A tech note linking to a note that only exists in the work vault.
+    await writeFile(
+      join(repoRoot, "tech/concepts/a.md"),
+      "see [[stack-state]] and [[nothing-at-all]]\n",
+      "utf-8"
+    );
+    await git(repoRoot, ["add", "-A"]);
+    await git(repoRoot, ["commit", "-m", "base"]);
+
+    client = await connect({
+      vaults: new Map([
+        ["tech", join(repoRoot, "tech")],
+        ["work", join(repoRoot, "work")],
+      ]),
+      defaultName: "tech",
+    });
+  });
+
+  afterEach(async () => {
+    await client.close();
+    await rm(repoRoot, { recursive: true, force: true });
+  });
+
+  it("classifies a cross-vault link as external, never broken", async () => {
+    const data = structured(
+      await client.callTool({ name: "lint_links", arguments: { vault: "tech" } })
+    );
+    expect(data["summary"]).toMatchObject({ external: 1, broken: 1 });
+
+    const external = data["findings"].find((f: any) => f.class === "external");
+    expect(external).toMatchObject({ target: "stack-state", externalVault: "work" });
+
+    const broken = data["findings"].find((f: any) => f.class === "broken");
+    expect(broken).toMatchObject({ target: "nothing-at-all" });
+  });
+
+  it("lints every vault when none is named", async () => {
+    const data = structured(await client.callTool({ name: "lint_links", arguments: {} }));
+    expect(data["summary"]["vaults"]).toEqual(["tech", "work"]);
   });
 });

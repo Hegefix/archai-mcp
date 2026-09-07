@@ -1,68 +1,54 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v3";
-import { type VaultRegistry, resolveVault } from "../vaults.js";
-import { readFile, writeFile } from "node:fs/promises";
-import * as path from "node:path";
+import { type VaultRegistry, resolveVault, isLogEnabled } from "../vaults.js";
+import { afterWrite } from "../hooks.js";
+import { createJournal } from "../rollback.js";
 import {
-  resolveVaultPath,
-  getAllMarkdownFiles,
-  vaultBasename,
-} from "../paths.js";
-import {
-  rewriteWikilinks,
-  rewriteMarkdownLinks,
-} from "../wikilinks.js";
-import { resolveMarkdownLinkUrl } from "../refactor.js";
+  applyRewrites,
+  buildIndex,
+  describeRewrites,
+  formatRewrites,
+  loadNotes,
+  normalizeMapping,
+  planRewrites,
+} from "../refactor.js";
 
-interface LinkUpdateRecord {
-  path: string;
-  old: string;
-  new: string;
-  line: number;
-}
-
-function replaceBasenameInUrl(url: string, newBasename: string): string {
-  const hashIdx = url.indexOf("#");
-  const queryIdx = url.indexOf("?");
-  let cutIdx = -1;
-  if (hashIdx !== -1) cutIdx = hashIdx;
-  if (queryIdx !== -1 && (cutIdx === -1 || queryIdx < cutIdx)) cutIdx = queryIdx;
-  const pathPart = cutIdx === -1 ? url : url.slice(0, cutIdx);
-  const suffix = cutIdx === -1 ? "" : url.slice(cutIdx);
-  const dir = path.posix.dirname(pathPart);
-  const newPath = dir === "." ? `${newBasename}.md` : `${dir}/${newBasename}.md`;
-  return newPath + suffix;
-}
-
-export function registerRewriteLinks(
-  server: McpServer,
-  registry: VaultRegistry
-): void {
+export function registerRewriteLinks(server: McpServer, registry: VaultRegistry): void {
   server.registerTool(
     "rewrite_links",
     {
       description:
-        "Mass-rename wikilink targets across the vault without moving any files. Useful when a note was renamed in Obsidian's UI and links broke, or when consolidating aliases. Rewrites [[from...]] / ![[from...]] preserving alias / heading / block-id, and markdown-style links whose target basename matches `from` (preserving the link's directory).",
+        "Rewrite wikilink targets across a vault from an explicit old->new mapping, " +
+        "leaving the notes themselves where they are. Built to consume lint_links' " +
+        "renamed-candidate suggestions. Alias and heading parts are preserved: " +
+        "[[old|Label]] becomes [[new|Label]] and [[old#Section]] becomes [[new#Section]]. " +
+        "Mapping keys match a link target's basename, so one key covers both [[old]] and " +
+        "[[folder/old]]. Use dry_run to see the diff first.",
       inputSchema: {
-        from: z
-          .string()
-          .describe('Old basename, e.g. "archai-mcp-server"'),
-        to: z.string().describe("New basename"),
+        mapping: z
+          .record(z.string())
+          .describe(
+            "Old target to new target, e.g. { \"old-note\": \"new-note\" }. Keys and " +
+              "values may carry folders or a .md extension; only the key's basename is " +
+              "matched, and the written form follows the vault's convention (bare " +
+              "basename unless it is ambiguous)."
+          ),
         dry_run: z
           .boolean()
           .optional()
-          .describe("Plan only — do not write. Default false."),
+          .describe("Report the diff that would be applied and write nothing."),
         vault: z
           .string()
           .optional()
           .describe("Vault name (defaults to the primary vault)"),
       },
-      annotations: { destructiveHint: true },
     },
-    async ({ from, to, dry_run = false, vault }) => {
+    async ({ mapping, dry_run, vault }) => {
       let vaultPath: string;
+      let normalized;
       try {
         vaultPath = resolveVault(registry, vault);
+        normalized = normalizeMapping(mapping);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
@@ -70,91 +56,90 @@ export function registerRewriteLinks(
           isError: true,
         };
       }
+      const vaultName = vault ?? registry.defaultName;
 
-      if (typeof from !== "string" || typeof to !== "string") {
+      if (normalized.size === 0) {
+        return {
+          content: [{ type: "text" as const, text: "Error: mapping is empty" }],
+          isError: true,
+        };
+      }
+
+      const index = await buildIndex(vaultName, vaultPath);
+      const notes = await loadNotes(vaultPath);
+      const rewrites = planRewrites(notes, normalized, index);
+      const summary = describeRewrites(rewrites);
+
+      if (rewrites.length === 0) {
         return {
           content: [
-            { type: "text" as const, text: "Error: from and to must be strings" },
+            {
+              type: "text" as const,
+              text: `No links matched the mapping in vault "${vaultName}".`,
+            },
+          ],
+          structuredContent: { vault: vaultName, dryRun: dry_run === true, rewrites: [] },
+        };
+      }
+
+      const diff = formatRewrites(vaultName, rewrites);
+
+      if (dry_run === true) {
+        return {
+          content: [
+            { type: "text" as const, text: `Dry run — would rewrite ${summary}:\n\n${diff}` },
+          ],
+          structuredContent: {
+            vault: vaultName,
+            dryRun: true,
+            rewrites: rewrites.map((r) => ({ file: r.file, changes: r.changes })),
+          },
+        };
+      }
+
+      // A part-applied rewrite leaves the graph in a state nobody asked for: some
+      // notes pointing at the new name, some at the old. Undo and report instead.
+      const journal = createJournal();
+      try {
+        await applyRewrites(vaultPath, rewrites, journal);
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        const restoreWarnings = await journal.rollback();
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: rewrite failed and was rolled back: ${detail}${
+                restoreWarnings.length > 0 ? `\n${restoreWarnings.join("\n")}` : ""
+              }`,
+            },
           ],
           isError: true,
         };
       }
-      if (from === to) {
-        return {
-          content: [
-            { type: "text" as const, text: "No-op: from === to" },
-          ],
-          structuredContent: { updates: [], dry_run },
-        };
-      }
 
-      const fromBasename =
-        from.replace(/\.md$/, "").split("/").pop() ?? from;
-      const toBasename =
-        to.replace(/\.md$/, "").split("/").pop() ?? to;
+      const warnings = await afterWrite({
+        tool: "rewrite_links",
+        vaultName,
+        vaultPath,
+        path: `${rewrites.length} file(s)`,
+        paths: rewrites.map((r) => r.file),
+        log: isLogEnabled(registry, vaultName),
+        message: `rewrite_links: ${summary}`,
+      });
 
-      const files = await getAllMarkdownFiles(vaultPath);
-      const updates: LinkUpdateRecord[] = [];
-      const writes = new Map<string, string>();
-
-      for (const file of files) {
-        const full = resolveVaultPath(vaultPath, file);
-        const original = await readFile(full, "utf-8");
-        let current = original;
-
-        const wl = rewriteWikilinks(current, fromBasename, toBasename);
-        if (wl.updates.length > 0) {
-          current = wl.content;
-          for (const u of wl.updates) {
-            updates.push({
-              path: file,
-              old: u.raw,
-              new: u.replacement,
-              line: u.line,
-            });
-          }
-        }
-
-        const ml = rewriteMarkdownLinks(current, (url) => {
-          const resolved = resolveMarkdownLinkUrl(file, url);
-          if (resolved === null) return null;
-          if (vaultBasename(resolved) !== fromBasename) return null;
-          return replaceBasenameInUrl(url, toBasename);
-        });
-        if (ml.updates.length > 0) {
-          current = ml.content;
-          for (const u of ml.updates) {
-            updates.push({
-              path: file,
-              old: u.raw,
-              new: u.replacement,
-              line: u.line,
-            });
-          }
-        }
-
-        if (current !== original) writes.set(file, current);
-      }
-
-      if (!dry_run) {
-        for (const [file, content] of writes) {
-          await writeFile(
-            resolveVaultPath(vaultPath, file),
-            content,
-            "utf-8"
-          );
-        }
-      }
-
-      const verb = dry_run ? "[dry-run] Would rewrite" : "Rewrote";
+      const trailer = warnings.length > 0 ? `\n\n${warnings.join("\n")}` : "";
       return {
         content: [
-          {
-            type: "text" as const,
-            text: `${verb} ${updates.length} link(s) across ${writes.size} file(s).`,
-          },
+          { type: "text" as const, text: `Rewrote ${summary}:\n\n${diff}${trailer}` },
         ],
-        structuredContent: { updates, dry_run },
+        structuredContent: {
+          vault: vaultName,
+          dryRun: false,
+          links: rewrites.reduce((sum, r) => sum + r.changes.length, 0),
+          files: rewrites.length,
+          rewrites: rewrites.map((r) => ({ file: r.file, changes: r.changes })),
+        },
       };
     }
   );

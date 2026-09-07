@@ -1,58 +1,32 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v3";
 import { type VaultRegistry, resolveVault } from "../vaults.js";
-import { readFile } from "node:fs/promises";
-import {
-  resolveVaultPath,
-  getAllMarkdownFiles,
-  vaultBasename,
-} from "../paths.js";
-import { scanLinks, contextSnippet, type LinkKind } from "../wikilinks.js";
-import * as path from "node:path";
-
-interface Backlink {
-  path: string;
-  line: number;
-  column: number;
-  link_type: LinkKind;
-  raw: string;
-  context: string;
-}
-
-function resolveMarkdownLinkUrl(
-  notePath: string,
-  linkUrl: string
-): string | null {
-  if (/^[a-z][a-z0-9+.-]*:/i.test(linkUrl)) return null;
-  if (linkUrl.startsWith("#")) return null;
-  const cleaned = linkUrl.split("#")[0]?.split("?")[0] ?? "";
-  if (!cleaned) return null;
-  let decoded: string;
-  try {
-    decoded = decodeURIComponent(cleaned);
-  } catch {
-    decoded = cleaned;
-  }
-  const noteDir = path.posix.dirname(notePath);
-  const joined = path.posix.normalize(path.posix.join(noteDir, decoded));
-  if (joined === ".." || joined.startsWith("../")) return null;
-  return joined;
-}
+import { describeVaultLayouts, firstTopLevelFolder, type VaultFolderInfo } from "../text.js";
+import { buildIndex, findBacklinks, loadNotes, stem } from "../refactor.js";
 
 export function registerFindBacklinks(
   server: McpServer,
-  registry: VaultRegistry
+  registry: VaultRegistry,
+  vaultFolders: VaultFolderInfo[]
 ): void {
+  const defaultVault = vaultFolders.find((v) => v.name === registry.defaultName);
+  const layoutSummary = describeVaultLayouts(vaultFolders);
+  const folder = firstTopLevelFolder(defaultVault);
+  const pathExample = folder ? `${folder}/example-note.md` : "example-note.md";
+
   server.registerTool(
     "find_backlinks",
     {
       description:
-        "Find every note in the vault that links to the target. Resolves wikilinks by basename (Obsidian's behavior). Returns each backlink with file path, 1-indexed line/column, link type (wikilink|wikilink_embed|markdown), raw matched text, and ~80 chars of surrounding context. Also returns resolved_files: every vault path whose basename matches the target. If resolved_files.length > 1, the target is ambiguous — callers must rename one of them before doing a basename-changing move.",
+        "List every note whose wikilinks point at a given note, with line numbers and " +
+        "the link text as written. Matches by link resolution, so bare, folder-prefixed, " +
+        "aliased and heading-anchored links to the same note are all found. Read-only.",
       inputSchema: {
-        target: z
+        path: z
           .string()
           .describe(
-            'Either a basename (e.g. "archai-mcp-server") or a relative path (e.g. "public/tech/archai-mcp-server.md"). Both collapse to a basename match.'
+            `Relative path of the note to find links to, e.g. "${pathExample}". ` +
+              `A bare basename works too. Known top-level folders — ${layoutSummary}.`
           ),
         vault: z
           .string()
@@ -61,7 +35,7 @@ export function registerFindBacklinks(
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ target, vault }) => {
+    async ({ path: notePath, vault }) => {
       let vaultPath: string;
       try {
         vaultPath = resolveVault(registry, vault);
@@ -72,14 +46,12 @@ export function registerFindBacklinks(
           isError: true,
         };
       }
+      const vaultName = vault ?? registry.defaultName;
 
-      let targetBasename: string;
+      let index, notes;
       try {
-        if (target.includes("/") || target.endsWith(".md")) {
-          targetBasename = vaultBasename(target);
-        } else {
-          targetBasename = target;
-        }
+        index = await buildIndex(vaultName, vaultPath);
+        notes = await loadNotes(vaultPath);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         return {
@@ -88,56 +60,44 @@ export function registerFindBacklinks(
         };
       }
 
-      const files = await getAllMarkdownFiles(vaultPath);
-      const resolved_files: string[] = [];
-      const backlinks: Backlink[] = [];
+      // Accept a bare basename or a partial path by resolving it the same way a
+      // link would be, so the caller doesn't have to know the note's full path.
+      const requested = stem(notePath);
+      const resolved = index.paths.has(requested)
+        ? requested
+        : index.byBasename.get(requested.split("/").pop() as string)?.[0];
 
-      for (const file of files) {
-        if (vaultBasename(file) === targetBasename) {
-          resolved_files.push(file);
-        }
-        const full = resolveVaultPath(vaultPath, file);
-        const content = await readFile(full, "utf-8");
-        const refs = scanLinks(content);
-        for (const ref of refs) {
-          let isMatch = false;
-          if (ref.kind === "wikilink" || ref.kind === "wikilink_embed") {
-            isMatch = ref.basename === targetBasename;
-          } else if (ref.kind === "markdown" && ref.target) {
-            const resolved = resolveMarkdownLinkUrl(file, ref.target);
-            if (resolved !== null) {
-              isMatch = vaultBasename(resolved) === targetBasename;
-            }
-          }
-          if (!isMatch) continue;
-          backlinks.push({
-            path: file,
-            line: ref.line,
-            column: ref.column,
-            link_type: ref.kind,
-            raw: ref.raw,
-            context: contextSnippet(content, ref.offset, ref.length),
-          });
-        }
+      if (resolved === undefined) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: no note matching "${notePath}" in vault "${vaultName}"`,
+            },
+          ],
+          isError: true,
+        };
       }
 
-      resolved_files.sort();
-      const lines = [
-        `Found ${backlinks.length} backlink${backlinks.length === 1 ? "" : "s"} to ${targetBasename}.`,
-      ];
-      if (resolved_files.length === 0) {
-        lines.push("No files in the vault have this basename.");
-      } else if (resolved_files.length > 1) {
-        lines.push(
-          `Ambiguous: matches ${resolved_files.length} files (${resolved_files.join(", ")}).`
-        );
-      }
+      const backlinks = findBacklinks(notes, index, resolved);
+      const files = new Set(backlinks.map((b) => b.file));
+
+      const header =
+        `${backlinks.length} link(s) to [${vaultName}] ${resolved}.md ` +
+        `in ${files.size} note(s)`;
+      const body = backlinks
+        .map((b) => `- ${b.file}:${b.line}  ${b.raw}`)
+        .join("\n");
 
       return {
-        content: [{ type: "text" as const, text: lines.join("\n") }],
+        content: [
+          { type: "text" as const, text: body === "" ? header : `${header}\n\n${body}` },
+        ],
         structuredContent: {
-          target: targetBasename,
-          resolved_files,
+          vault: vaultName,
+          note: `${resolved}.md`,
+          count: backlinks.length,
+          files: files.size,
           backlinks,
         },
       };

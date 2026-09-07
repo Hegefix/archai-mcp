@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { readFile } from "node:fs/promises";
+import { readdir } from "node:fs/promises";
 import { glob } from "glob";
 
 export function normalizeVaultPath(input: string): string {
@@ -25,37 +25,11 @@ export function normalizeVaultPath(input: string): string {
 
 export function resolveVaultPath(vaultPath: string, relativePath: string): string {
   const normalized = normalizeVaultPath(relativePath);
-  const resolved = path.resolve(vaultPath, normalized);
-  // A string prefix check would accept a sibling like "/vaults/tech-old" for
-  // vault "/vaults/tech"; compare on segment boundaries instead.
-  const rel = path.relative(path.resolve(vaultPath), resolved);
-  if (rel.startsWith("..") || path.isAbsolute(rel)) {
+  const resolved = path.join(vaultPath, normalized);
+  if (!resolved.startsWith(vaultPath)) {
     throw new Error("Path traversal detected");
   }
   return resolved;
-}
-
-export function relativeFromTo(fromFile: string, toFile: string): string {
-  const fromDir = path.posix.dirname(normalizeVaultPath(fromFile));
-  const toNorm = normalizeVaultPath(toFile);
-  return path.posix.relative(fromDir, toNorm);
-}
-
-export function vaultBasename(rel: string): string {
-  return path.posix.basename(normalizeVaultPath(rel), ".md");
-}
-
-export function getAllAttachmentFiles(
-  vaultPath: string,
-  extensions: readonly string[]
-): Promise<string[]> {
-  return glob(`**/*.{${extensions.join(",")}}`, {
-    cwd: vaultPath,
-    ignore: [".obsidian/**"],
-    nodir: true,
-    posix: true,
-    nocase: true,
-  });
 }
 
 export function getAllMarkdownFiles(vaultPath: string): Promise<string[]> {
@@ -67,15 +41,39 @@ export function getAllMarkdownFiles(vaultPath: string): Promise<string[]> {
   });
 }
 
-/**
- * Read a note, yielding null instead of throwing. Vault scans race with Obsidian
- * and git: a file listed by glob can be gone or unreadable microseconds later,
- * and one such file must not fail the whole search/list/save call.
- */
-export async function readNoteOrNull(fullPath: string): Promise<string | null> {
+/** Real top-level directories in a vault, excluding `.obsidian`. Empty if the vault root doesn't exist yet. */
+export async function listTopLevelFolders(vaultPath: string): Promise<string[]> {
+  let entries;
   try {
-    return await readFile(fullPath, "utf-8");
+    entries = await readdir(vaultPath, { withFileTypes: true });
   } catch {
-    return null;
+    return [];
+  }
+  return entries
+    .filter((entry) => entry.isDirectory() && entry.name !== ".obsidian")
+    .map((entry) => entry.name)
+    .sort();
+}
+
+/**
+ * Throws unless `relativePath`'s first segment is an existing top-level folder in the vault.
+ * A path resolving to the vault root (".") is always allowed.
+ */
+export async function assertKnownTopLevelFolder(
+  vaultPath: string,
+  vaultName: string,
+  relativePath: string
+): Promise<void> {
+  const normalized = normalizeVaultPath(relativePath);
+  if (normalized === ".") return;
+  const topSegment = normalized.split("/")[0] as string;
+  const known = await listTopLevelFolders(vaultPath);
+  if (!known.includes(topSegment)) {
+    const available =
+      known.length > 0 ? known.join(", ") : "(none — this vault has no subfolders yet)";
+    throw new Error(
+      `Unknown top-level folder "${topSegment}" in vault "${vaultName}". ` +
+        `Existing top-level folders: ${available}. Pass allowNewTopLevel: true to create it.`
+    );
   }
 }

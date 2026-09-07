@@ -1,269 +1,330 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v3";
-import { type VaultRegistry, resolveVault } from "../vaults.js";
-import { readFile, writeFile, unlink, mkdir, stat } from "node:fs/promises";
-import { dirname } from "node:path";
+import { stat } from "node:fs/promises";
+import { posix } from "node:path";
+import matter from "gray-matter";
+import { normalizeVaultPath, resolveVaultPath, assertKnownTopLevelFolder } from "../paths.js";
+import { type VaultRegistry, resolveVault, isLogEnabled } from "../vaults.js";
+import { describeVaultLayouts, firstTopLevelFolder, toKebabCase, type VaultFolderInfo } from "../text.js";
+import { gitMove, stageVault } from "../git.js";
+import { afterWrite } from "../hooks.js";
+import { createJournal } from "../rollback.js";
+import { LOG_FILE } from "../log.js";
+import { REFERENCES_DIR } from "./save_reference.js";
 import {
-  resolveVaultPath,
-  getAllMarkdownFiles,
-  normalizeVaultPath,
-  vaultBasename,
-} from "../paths.js";
-import { rewriteWikilinks } from "../wikilinks.js";
-import {
-  recomputeMovedFileLinks,
-  rewriteMarkdownLinksByPathMap,
-  bumpUpdated,
-  findAmbiguityConflicts,
+  applyRewrites,
+  buildIndex,
+  formatRewrites,
+  loadNotes,
+  planRewrites,
+  stem,
+  type FileRewrite,
 } from "../refactor.js";
 
-interface LinkUpdateRecord {
-  path: string;
-  old: string;
-  new: string;
-  line: number;
+/** Refusal reasons that are about the vault's structure rather than the paths given. */
+export type MoveCheck = { ok: true } | { ok: false; error: string };
+
+/**
+ * Structural rules on a move, independent of the filesystem.
+ *
+ * `references/` is immutable by design — there is no `update_reference`, and
+ * `save_reference` refuses to overwrite — so moving a file into or out of it would
+ * be the edit path the tool surface deliberately withholds. `log.md` is the
+ * vault's own bookkeeping, not a note.
+ */
+export function checkMovable(from: string, to: string): MoveCheck {
+  for (const [label, path] of [["from", from], ["to", to]] as const) {
+    if (path === LOG_FILE) {
+      return { ok: false, error: `refusing to move ${label} the vault's ${LOG_FILE}` };
+    }
+    if (path === REFERENCES_DIR || path.startsWith(`${REFERENCES_DIR}/`)) {
+      return {
+        ok: false,
+        error:
+          `refusing to move ${label} ${REFERENCES_DIR}/: references are immutable ` +
+          `captured source material`,
+      };
+    }
+  }
+  if (stem(from) === stem(to)) {
+    return { ok: false, error: `from and to are the same path: ${from}` };
+  }
+  return { ok: true };
 }
 
-type Resp = {
-  content: Array<{ type: "text"; text: string }>;
-  structuredContent?: Record<string, unknown>;
-  isError?: boolean;
+/**
+ * Settle the destination path.
+ *
+ * A `to` that names an existing directory, or ends in a slash, means "move the
+ * note in here under its current name" — the common folder reshuffle. A `to` with
+ * no extension gets `.md`, matching `save`'s filename generation.
+ */
+export async function resolveDestination(
+  vaultPath: string,
+  from: string,
+  to: string
+): Promise<string> {
+  const looksLikeFolder = to.endsWith("/") || (await isDirectory(vaultPath, to));
+  const joined = looksLikeFolder
+    ? posix.join(normalizeVaultPath(to), posix.basename(from))
+    : normalizeVaultPath(to);
+  return /\.[^/]+$/.test(joined) ? joined : `${joined}.md`;
+}
+
+async function isDirectory(vaultPath: string, relative: string): Promise<boolean> {
+  try {
+    return (await stat(resolveVaultPath(vaultPath, relative))).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+export type MovePlan = {
+  from: string;
+  to: string;
+  rewrites: FileRewrite[];
+  /** Set when the note's frontmatter title no longer matches its filename. */
+  titleNote?: string;
 };
 
-function errText(msg: string): Resp {
-  return {
-    content: [{ type: "text" as const, text: `Error: ${msg}` }],
-    isError: true,
-  };
+/**
+ * Note when the frontmatter title and the new filename have drifted apart.
+ *
+ * The title is deliberately not rewritten — filename and title are decoupled in
+ * this vault by design (`stack-state.md` is titled "GoodHabitz Mobile Stack
+ * State") — so the divergence is reported for the caller to judge rather than
+ * silently "fixed".
+ */
+export function titleDivergence(content: string, to: string): string | undefined {
+  let title: unknown;
+  try {
+    title = matter(content).data["title"];
+  } catch {
+    return undefined;
+  }
+  if (typeof title !== "string" || title.trim() === "") return undefined;
+
+  const basename = posix.basename(stem(to));
+  if (toKebabCase(title) === basename) return undefined;
+  return (
+    `frontmatter title "${title}" does not match the new filename "${basename}". ` +
+    `Titles are not rewritten by move; update it with the update tool if you want them aligned.`
+  );
 }
 
-function ok(structured: Record<string, unknown>, text: string): Resp {
-  return {
-    content: [{ type: "text" as const, text }],
-    structuredContent: structured,
-  };
-}
+export function registerMove(
+  server: McpServer,
+  registry: VaultRegistry,
+  vaultFolders: VaultFolderInfo[]
+): void {
+  const defaultVault = vaultFolders.find((v) => v.name === registry.defaultName);
+  const layoutSummary = describeVaultLayouts(vaultFolders);
+  const folder = firstTopLevelFolder(defaultVault);
+  const example = folder ? `${folder}/example-note.md` : "example-note.md";
 
-export function registerMove(server: McpServer, registry: VaultRegistry): void {
   server.registerTool(
     "move",
     {
       description:
-        "Move or rename a note. By default updates all wikilinks and markdown-style links across the vault so references stay valid. If the destination basename collides with an existing distinct file, the move is refused unless allow_ambiguity=true. If the destination path exists, the move is refused unless overwrite=true. Set dry_run=true to inspect the planned link updates without writing. Bumps the moved note's frontmatter `updated` field (date-only); backlink-only edits in other notes do not bump theirs.",
+        "Move or rename a note and rewrite every inbound wikilink so the graph stays " +
+        "intact. The file is moved with git mv, so history follows the rename. Refuses " +
+        "to overwrite an existing target. Frontmatter titles are never rewritten — a " +
+        "divergence between title and filename is reported instead. Use dry_run to see " +
+        "the plan first.",
       inputSchema: {
         from: z
           .string()
-          .describe('Source path relative to vault root, must end in .md'),
+          .describe(`Current path of the note, e.g. "${example}".`),
         to: z
           .string()
-          .describe('Destination path relative to vault root, must end in .md'),
+          .describe(
+            `New path. A folder (or a trailing "/") keeps the current filename; a ` +
+              `missing extension gets ".md". Known top-level folders — ${layoutSummary}.`
+          ),
         update_links: z
           .boolean()
           .optional()
-          .describe('Rewrite incoming wikilinks and markdown links across the vault. Default true.'),
+          .describe(
+            "Rewrite inbound wikilinks in other notes to point at the new path. " +
+              "Defaults to true; false moves the file and leaves links dangling."
+          ),
         dry_run: z
           .boolean()
           .optional()
-          .describe('Plan only — do not write. Default false.'),
-        overwrite: z
+          .describe("Report what would change and write nothing."),
+        allowNewTopLevel: z
           .boolean()
           .optional()
-          .describe('Permit writing over an existing destination file. Default false.'),
-        allow_ambiguity: z
-          .boolean()
-          .optional()
-          .describe('Permit proceeding when the destination basename already names another file in the vault. Default false.'),
+          .describe(
+            "Allow a destination under a top-level folder that doesn't exist yet."
+          ),
         vault: z
           .string()
           .optional()
           .describe("Vault name (defaults to the primary vault)"),
       },
-      annotations: { destructiveHint: true },
     },
-    async ({
-      from: fromRaw,
-      to: toRaw,
-      update_links = true,
-      dry_run = false,
-      overwrite = false,
-      allow_ambiguity = false,
-      vault,
-    }) => {
+    async ({ from, to, update_links, dry_run, allowNewTopLevel, vault }) => {
+      const fail = (msg: string) => ({
+        content: [{ type: "text" as const, text: `Error: ${msg}` }],
+        isError: true as const,
+      });
+
       let vaultPath: string;
+      let fromRel: string;
+      let toRel: string;
       try {
         vaultPath = resolveVault(registry, vault);
+        // All path safety comes from paths.ts, including the traversal messages.
+        fromRel = normalizeVaultPath(from);
+        resolveVaultPath(vaultPath, fromRel);
+        toRel = await resolveDestination(vaultPath, fromRel, to);
+        resolveVaultPath(vaultPath, toRel);
       } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
+        return fail(err instanceof Error ? err.message : String(err));
+      }
+      const vaultName = vault ?? registry.defaultName;
+
+      const check = checkMovable(fromRel, toRel);
+      if (!check.ok) return fail(check.error);
+
+      try {
+        const fromStat = await stat(resolveVaultPath(vaultPath, fromRel));
+        if (!fromStat.isFile()) return fail(`${fromRel} is not a file`);
+      } catch {
+        return fail(`file not found at ${fromRel}`);
+      }
+
+      try {
+        await stat(resolveVaultPath(vaultPath, toRel));
+        return fail(`${toRel} already exists — refusing to overwrite`);
+      } catch {
+        // Free destination, which is what we need.
+      }
+
+      if (allowNewTopLevel !== true) {
+        try {
+          await assertKnownTopLevelFolder(vaultPath, vaultName, posix.dirname(toRel));
+        } catch (err) {
+          return fail(err instanceof Error ? err.message : String(err));
+        }
+      }
+
+      const notes = await loadNotes(vaultPath);
+      const source = notes.find((n) => n.file === fromRel);
+      const titleNote =
+        source === undefined ? undefined : titleDivergence(source.content, toRel);
+
+      if (dry_run === true) {
+        // Predict the post-move index so the reported link forms are the ones a real
+        // run would write.
+        const projected = await buildIndex(vaultName, vaultPath);
+        projected.paths.delete(stem(fromRel));
+        projected.paths.add(stem(toRel));
+        const rewrites =
+          update_links === false
+            ? []
+            : planRewrites(
+                notes.filter((n) => n.file !== fromRel),
+                new Map([[posix.basename(stem(fromRel)), stem(toRel)]]),
+                projected
+              );
+        const links = rewrites.reduce((sum, r) => sum + r.changes.length, 0);
+        const diff = rewrites.length > 0 ? `\n\n${formatRewrites(vaultName, rewrites)}` : "";
         return {
-          content: [{ type: "text" as const, text: `Error: ${msg}` }],
-          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Dry run — would move [${vaultName}] ${fromRel} -> ${toRel} ` +
+                `(+${links} links in ${rewrites.length} files)${diff}` +
+                (titleNote === undefined ? "" : `\n\nNote: ${titleNote}`),
+            },
+          ],
+          structuredContent: {
+            vault: vaultName,
+            from: fromRel,
+            to: toRel,
+            dryRun: true,
+            links,
+            files: rewrites.length,
+            rewrites: rewrites.map((r) => ({ file: r.file, changes: r.changes })),
+            ...(titleNote === undefined ? {} : { titleNote }),
+          },
         };
       }
 
-      let from: string;
-      let to: string;
+      const journal = createJournal();
+      let rewrites: FileRewrite[] = [];
       try {
-        from = normalizeVaultPath(fromRaw);
-        to = normalizeVaultPath(toRaw);
-      } catch (err) {
-        return errText(err instanceof Error ? err.message : String(err));
-      }
-      if (!from.endsWith(".md")) {
-        return errText(`from must end in .md, got "${from}"`);
-      }
-      if (!to.endsWith(".md")) {
-        return errText(`to must end in .md, got "${to}"`);
-      }
+        // Journal both ends of the rename so a rollback puts the file back.
+        await journal.record(resolveVaultPath(vaultPath, fromRel));
+        await journal.record(resolveVaultPath(vaultPath, toRel));
+        await gitMove(vaultPath, fromRel, toRel);
 
-      if (from === to) {
-        return ok(
-          {
-            moved: false,
-            from,
-            to,
-            link_updates: [],
-            warnings: ["from === to (no-op)"],
-            dry_run,
-          },
-          `No-op: from === to (${from})`
-        );
-      }
-
-      const fromFull = resolveVaultPath(vaultPath, from);
-      const toFull = resolveVaultPath(vaultPath, to);
-
-      let fromContent: string;
-      try {
-        fromContent = await readFile(fromFull, "utf-8");
-      } catch {
-        return errText(`from not found: ${from}`);
-      }
-
-      let toExists = false;
-      try {
-        await stat(toFull);
-        toExists = true;
-      } catch {
-        toExists = false;
-      }
-      if (toExists && !overwrite) {
-        return errText(
-          `to already exists: ${to}. Pass overwrite: true to replace it.`
-        );
-      }
-
-      const fromBasename = vaultBasename(from);
-      const toBasename = vaultBasename(to);
-      const basenameChanged = fromBasename !== toBasename;
-
-      const warnings: string[] = [];
-      if (basenameChanged) {
-        const exclude = [from];
-        if (overwrite && toExists) exclude.push(to);
-        const conflicts = await findAmbiguityConflicts(
-          vaultPath,
-          toBasename,
-          exclude
-        );
-        if (conflicts.length > 0) {
-          if (!allow_ambiguity) {
-            return errText(
-              `Destination basename "${toBasename}" already used by: ${conflicts.join(", ")}. Pass allow_ambiguity: true to proceed.`
-            );
-          }
-          warnings.push(
-            `Destination basename "${toBasename}" already used by: ${conflicts.join(", ")}`
+        if (update_links !== false) {
+          // Index after the move, so a link's written form reflects the vault as it
+          // now stands rather than as it was.
+          const index = await buildIndex(vaultName, vaultPath);
+          rewrites = planRewrites(
+            notes.filter((n) => n.file !== fromRel),
+            new Map([[posix.basename(stem(fromRel)), stem(toRel)]]),
+            index
           );
+          await applyRewrites(vaultPath, rewrites, journal);
         }
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        const restoreWarnings = await journal.rollback();
+        await stageVault(vaultPath, [fromRel, toRel, ...rewrites.map((r) => r.file)]);
+        return fail(
+          `move failed and was rolled back: ${detail}` +
+            (restoreWarnings.length > 0 ? `\n${restoreWarnings.join("\n")}` : "")
+        );
       }
 
-      const pathMap = new Map<string, string>([[from, to]]);
-      const outgoing = recomputeMovedFileLinks(
-        fromContent,
-        from,
-        to,
-        pathMap
-      );
-      const movedContent = bumpUpdated(outgoing.content);
+      const links = rewrites.reduce((sum, r) => sum + r.changes.length, 0);
+      const summary = `(+${links} links in ${rewrites.length} files)`;
 
-      const linkUpdates: LinkUpdateRecord[] = [];
-      const backlinkWrites = new Map<string, string>();
+      // One commit for the whole operation — the rename and every link it dragged
+      // along describe a single change.
+      const warnings = await afterWrite({
+        tool: "move",
+        vaultName,
+        vaultPath,
+        path: toRel,
+        // Both ends of the rename plus every note whose links changed — the commit
+        // is scoped to exactly this list.
+        paths: [fromRel, toRel, ...rewrites.map((r) => r.file)],
+        log: isLogEnabled(registry, vaultName),
+        message: `move: ${fromRel} -> ${toRel} ${summary}`,
+      });
 
-      if (update_links) {
-        const files = await getAllMarkdownFiles(vaultPath);
-        for (const file of files) {
-          if (file === from || file === to) continue;
-          const full = resolveVaultPath(vaultPath, file);
-          const original = await readFile(full, "utf-8");
-          let current = original;
-
-          if (basenameChanged) {
-            const wl = rewriteWikilinks(current, fromBasename, toBasename);
-            if (wl.updates.length > 0) {
-              current = wl.content;
-              for (const u of wl.updates) {
-                linkUpdates.push({
-                  path: file,
-                  old: u.raw,
-                  new: u.replacement,
-                  line: u.line,
-                });
-              }
-            }
-          }
-
-          const ml = rewriteMarkdownLinksByPathMap(current, file, pathMap);
-          if (ml.updates.length > 0) {
-            current = ml.content;
-            for (const u of ml.updates) {
-              linkUpdates.push({
-                path: file,
-                old: u.raw,
-                new: u.replacement,
-                line: u.line,
-              });
-            }
-          }
-
-          if (current !== original) {
-            backlinkWrites.set(file, current);
-          }
-        }
-      }
-
-      const result = {
-        moved: !dry_run,
-        from,
-        to,
-        link_updates: linkUpdates,
-        warnings,
-        dry_run,
+      const diff = rewrites.length > 0 ? `\n\n${formatRewrites(vaultName, rewrites)}` : "";
+      const notes_ = [
+        ...(titleNote === undefined ? [] : [`Note: ${titleNote}`]),
+        ...warnings,
+      ];
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text:
+              `Moved: [${vaultName}] ${fromRel} -> ${toRel} ${summary}${diff}` +
+              (notes_.length > 0 ? `\n\n${notes_.join("\n")}` : ""),
+          },
+        ],
+        structuredContent: {
+          vault: vaultName,
+          from: fromRel,
+          to: toRel,
+          dryRun: false,
+          links,
+          files: rewrites.length,
+          rewrites: rewrites.map((r) => ({ file: r.file, changes: r.changes })),
+          ...(titleNote === undefined ? {} : { titleNote }),
+        },
       };
-
-      if (dry_run) {
-        return ok(
-          result,
-          `[dry-run] Would move ${from} → ${to}. ${linkUpdates.length} link update(s) across ${backlinkWrites.size} file(s).`
-        );
-      }
-
-      await mkdir(dirname(toFull), { recursive: true });
-      await writeFile(toFull, movedContent, "utf-8");
-      for (const [file, content] of backlinkWrites) {
-        await writeFile(
-          resolveVaultPath(vaultPath, file),
-          content,
-          "utf-8"
-        );
-      }
-      if (fromFull !== toFull) {
-        await unlink(fromFull);
-      }
-
-      return ok(
-        result,
-        `Moved ${from} → ${to}. ${linkUpdates.length} link update(s) across ${backlinkWrites.size} file(s).${warnings.length > 0 ? "\nWarnings: " + warnings.join("; ") : ""}`
-      );
     }
   );
 }

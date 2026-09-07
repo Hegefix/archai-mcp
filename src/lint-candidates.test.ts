@@ -1,231 +1,214 @@
 import { describe, it, expect } from "vitest";
 import {
-  normalizeForMatch,
-  toKebabForMatch,
-  levenshtein,
-  findCandidates,
-  classifyBroken,
+  buildVaultIndex,
+  resolveTarget,
+  basenameSimilarity,
+  suggestTarget,
+  classifyLink,
+  summarize,
+  PLANNED_MARKER,
 } from "./lint-candidates.js";
+import { scanWikilinks, type Wikilink } from "./wikilinks.js";
 
-function makeMap(basenames: string[]): Map<string, string> {
-  const m = new Map<string, string>();
-  for (const b of basenames) m.set(b, `public/${b}.md`);
-  return m;
+/** The single link in `source`, so classification tests read as prose. */
+function link(source: string): Wikilink {
+  const [first] = scanWikilinks(source);
+  if (first === undefined) throw new Error(`no link in: ${source}`);
+  return first;
 }
 
-describe("normalizeForMatch", () => {
-  it("lowercases, replaces dashes and punctuation with space, collapses whitespace", () => {
-    expect(normalizeForMatch("How the Internet Works — HTTP, HTML, Protocols")).toBe(
-      "how the internet works http html protocols"
+const tech = buildVaultIndex("tech", [
+  "concepts/react/react-query.md",
+  "concepts/react/react-reconciliation.md",
+  "patterns/karpathy-llm-output-as-html.md",
+  "shared.md",
+  "deep/shared.md",
+]);
+const work = buildVaultIndex("work", ["mobile/stack-state.md", "me/growth-log.md"]);
+
+const context = (index = tech, renames = new Map<string, string>()) => ({
+  index,
+  others: [index === tech ? work : tech],
+  renames,
+});
+
+describe("resolveTarget", () => {
+  it("resolves a bare basename anywhere in the vault", () => {
+    expect(resolveTarget(tech, "react-query")).toBe("concepts/react/react-query");
+  });
+
+  it("resolves a full vault-relative path", () => {
+    expect(resolveTarget(tech, "concepts/react/react-query")).toBe(
+      "concepts/react/react-query"
     );
   });
 
-  it("treats hyphen as separator", () => {
-    expect(normalizeForMatch("how-the-internet-works")).toBe(
-      "how the internet works"
+  it("falls back to the basename when the folder prefix is wrong", () => {
+    expect(resolveTarget(tech, "wrong/folder/react-query")).toBe(
+      "concepts/react/react-query"
     );
   });
 
-  it("strips punctuation", () => {
-    expect(normalizeForMatch("FP vs. OOP: Trade-offs!")).toBe("fp vs oop trade offs");
+  it("tolerates an explicit .md extension", () => {
+    expect(resolveTarget(tech, "react-query.md")).toBe("concepts/react/react-query");
   });
 
-  it("returns empty for punctuation-only input", () => {
-    expect(normalizeForMatch("---")).toBe("");
-  });
-});
-
-describe("toKebabForMatch", () => {
-  it("handles em-dash and en-dash as separators", () => {
-    expect(toKebabForMatch("FP vs OOP — Trade-offs")).toBe("fp-vs-oop-trade-offs");
-    expect(toKebabForMatch("Concept – Other")).toBe("concept-other");
-  });
-
-  it("matches existing kebab-case", () => {
-    expect(toKebabForMatch("how the internet works")).toBe("how-the-internet-works");
+  it("returns undefined for a target that isn't there", () => {
+    expect(resolveTarget(tech, "no-such-note")).toBeUndefined();
   });
 });
 
-describe("levenshtein", () => {
-  it("returns 0 for identical strings", () => {
-    expect(levenshtein("abc", "abc")).toBe(0);
+describe("basenameSimilarity", () => {
+  it("scores an identical name 1", () => {
+    expect(basenameSimilarity("a-b", "a-b")).toBe(1);
   });
 
-  it("returns length for empty other", () => {
-    expect(levenshtein("", "abc")).toBe(3);
-    expect(levenshtein("abc", "")).toBe(3);
+  it("scores a qualified rename highly via token containment", () => {
+    expect(
+      basenameSimilarity("stack-state", "goodhabitz-mobile-stack-state")
+    ).toBeGreaterThanOrEqual(0.75);
   });
 
-  it("counts single substitution", () => {
-    expect(levenshtein("cat", "bat")).toBe(1);
+  it("does not let a single short token claim a longer name", () => {
+    expect(basenameSimilarity("react", "react-query")).toBeLessThan(0.75);
   });
 
-  it("counts insert", () => {
-    expect(levenshtein("cat", "cats")).toBe(1);
-  });
-});
-
-describe("findCandidates", () => {
-  it("title_match: title-form variant scores 1.0", () => {
-    const map = makeMap(["how-the-internet-works-http-html-protocols"]);
-    const out = findCandidates(
-      "How the Internet Works — HTTP, HTML, Protocols",
-      map
+  it("scores a suffix change highly", () => {
+    expect(basenameSimilarity("react-optimisation", "react-optimization")).toBeGreaterThan(
+      0.75
     );
-    expect(out).toHaveLength(1);
-    expect(out[0]!.reason).toBe("title_match");
-    expect(out[0]!.similarity).toBe(1.0);
-    expect(out[0]!.basename).toBe("how-the-internet-works-http-html-protocols");
   });
 
-  it("kebab_match: matches without normalization round-trip", () => {
-    const map = makeMap(["fp-vs-oop-trade-offs"]);
-    const out = findCandidates("FP vs OOP — Trade-offs", map);
-    expect(out[0]!.reason).toBe("title_match");
-  });
-
-  it("kebab_match wins when title_match doesn't apply", () => {
-    const map = makeMap(["fp-vs-oop-trade-offs"]);
-    const out = findCandidates("fp-vs-oop-trade-offs-extra", map);
-    expect(out[0]!.reason).not.toBe("title_match");
-  });
-
-  it("levenshtein: one-char typo", () => {
-    const map = makeMap(["algorithm-complexity-big-o"]);
-    const out = findCandidates("algorithm-complexity-bg-o", map);
-    expect(out[0]!.reason).toBe("levenshtein");
-    expect(out[0]!.similarity).toBeGreaterThanOrEqual(0.85);
-  });
-
-  it("levenshtein rejected when distance too large", () => {
-    const map = makeMap(["bar-baz-qux"]);
-    const out = findCandidates("foo", map);
-    expect(out.find((c) => c.reason === "levenshtein")).toBeUndefined();
-  });
-
-  it("substring: short target inside longer basename when length ratio >= 0.5", () => {
-    const map = makeMap(["dom-rendering"]);
-    const out = findCandidates("dom-render", map);
-    expect(out).toHaveLength(1);
-    expect(out[0]!.reason).toBe("substring");
-    expect(out[0]!.similarity).toBeGreaterThanOrEqual(0.5);
-    expect(out[0]!.similarity).toBeLessThan(1.0);
-  });
-
-  it("substring rejected when shorter < 50% of longer", () => {
-    const map = makeMap(["a-very-long-basename-with-many-words"]);
-    const out = findCandidates("a", map);
-    expect(out).toHaveLength(0);
-  });
-
-  it("DOM vs dom-rendering: too short → phantom (no candidate above floor)", () => {
-    const map = makeMap(["dom-rendering"]);
-    const out = findCandidates("DOM", map);
-    expect(out).toHaveLength(0);
-  });
-
-  it("phantom: unrelated target returns no candidates", () => {
-    const map = makeMap(["how-the-internet-works", "dom-rendering"]);
-    const out = findCandidates("completely-unrelated-thing", map);
-    expect(out).toHaveLength(0);
-  });
-
-  it("empty target returns no candidates", () => {
-    const map = makeMap(["anything"]);
-    expect(findCandidates("", map)).toHaveLength(0);
-    expect(findCandidates("---", map)).toHaveLength(0);
-  });
-
-  it("caps at top 3 and sorts by similarity descending", () => {
-    const map = makeMap([
-      "how-the-internet-works",
-      "how-the-internet-works-essentials",
-      "how-the-internet-works-deep-dive",
-      "how-the-internet-works-quickstart",
-      "how-the-internet-works-summary",
-    ]);
-    const out = findCandidates("how-the-internet-works", map);
-    expect(out.length).toBeLessThanOrEqual(3);
-    for (let i = 1; i < out.length; i++) {
-      expect(out[i - 1]!.similarity).toBeGreaterThanOrEqual(out[i]!.similarity);
-    }
-    expect(out[0]!.basename).toBe("how-the-internet-works");
+  it("scores unrelated names low", () => {
+    expect(basenameSimilarity("js-closures", "docker-networking")).toBeLessThan(0.4);
   });
 });
 
-describe("classifyBroken", () => {
-  it("title_match → title_form, high confidence", () => {
-    const c = classifyBroken([
-      {
-        basename: "x",
-        path: "x.md",
-        similarity: 1.0,
-        reason: "title_match",
-      },
-    ]);
-    expect(c.classification).toBe("title_form");
-    expect(c.suggestedFix.action).toBe("rewrite_to");
-    expect(c.suggestedFix.target_basename).toBe("x");
-    expect(c.suggestedFix.confidence).toBe("high");
+describe("suggestTarget", () => {
+  it("trusts git rename history over similarity", () => {
+    const renames = new Map([["old-name", "react-query"]]);
+    const { suggestion } = suggestTarget(tech, "old-name", renames);
+    expect(suggestion).toMatchObject({
+      target: "concepts/react/react-query",
+      source: "git-rename",
+    });
   });
 
-  it("kebab_match with sim 0.95 → title_form, high", () => {
-    const c = classifyBroken([
-      {
-        basename: "x",
-        path: "x.md",
-        similarity: 0.95,
-        reason: "kebab_match",
-      },
-    ]);
-    expect(c.classification).toBe("title_form");
-    expect(c.suggestedFix.confidence).toBe("high");
+  it("ignores rename history pointing at a note that no longer exists", () => {
+    const renames = new Map([["old-name", "also-gone"]]);
+    expect(suggestTarget(tech, "old-name", renames).suggestion).toBeUndefined();
   });
 
-  it("levenshtein sim >= 0.85 → typo, high", () => {
-    const c = classifyBroken([
-      {
-        basename: "x",
-        path: "x.md",
-        similarity: 0.88,
-        reason: "levenshtein",
-      },
-    ]);
-    expect(c.classification).toBe("typo");
-    expect(c.suggestedFix.confidence).toBe("high");
+  it("suggests a near match by basename similarity", () => {
+    const { suggestion } = suggestTarget(tech, "react-reconcilation", new Map());
+    expect(suggestion).toMatchObject({
+      target: "concepts/react/react-reconciliation",
+      source: "basename-similarity",
+    });
   });
 
-  it("levenshtein 0.75 ≤ sim < 0.85 → typo, medium", () => {
-    const c = classifyBroken([
-      {
-        basename: "x",
-        path: "x.md",
-        similarity: 0.78,
-        reason: "levenshtein",
-      },
-    ]);
-    expect(c.classification).toBe("typo");
-    expect(c.suggestedFix.confidence).toBe("medium");
+  it("suggests nothing for a name with no plausible match", () => {
+    const result = suggestTarget(tech, "completely-unrelated-thing", new Map());
+    expect(result.suggestion).toBeUndefined();
+    expect(result.ambiguous).toBeUndefined();
   });
 
-  it("substring only → phantom, no_clear_match", () => {
-    const c = classifyBroken([
-      {
-        basename: "x",
-        path: "x.md",
-        similarity: 0.6,
-        reason: "substring",
-      },
-    ]);
-    expect(c.classification).toBe("phantom");
-    expect(c.suggestedFix.action).toBe("no_clear_match");
-    expect(c.suggestedFix.confidence).toBe("low");
+  it("reports a tie as ambiguous rather than picking one", () => {
+    // Both candidates are one insertion away from the query, so neither is a
+    // better guess than the other and a bulk rewrite must not pick for the caller.
+    const index = buildVaultIndex("t", ["alpha-notes.md", "alpha-noted.md"]);
+    const result = suggestTarget(index, "alpha-note", new Map());
+    expect(result.suggestion).toBeUndefined();
+    expect(result.ambiguous).toEqual(["alpha-noted", "alpha-notes"]);
+  });
+});
+
+describe("classifyLink", () => {
+  it("classifies a resolving link as ok", () => {
+    const finding = classifyLink(link("[[react-query]]"), "a.md", context());
+    expect(finding).toMatchObject({ class: "ok", resolved: "concepts/react/react-query" });
   });
 
-  it("no candidates → phantom, low", () => {
-    const c = classifyBroken([]);
-    expect(c.classification).toBe("phantom");
-    expect(c.suggestedFix.action).toBe("no_clear_match");
-    expect(c.suggestedFix.confidence).toBe("low");
+  // Both vaults are separate Obsidian roots, so a link across them cannot resolve
+  // and must never be "repaired" into pointing at a local note.
+  it("classifies a link to a note in another vault as external", () => {
+    const finding = classifyLink(link("[[stack-state]]"), "a.md", context());
+    expect(finding).toMatchObject({ class: "external", externalVault: "work" });
+  });
+
+  it("classifies external in the other direction too", () => {
+    const finding = classifyLink(link("[[react-query]]"), "a.md", context(work));
+    expect(finding).toMatchObject({ class: "external", externalVault: "tech" });
+  });
+
+  it("does not suggest a local rename for a cross-vault link", () => {
+    const finding = classifyLink(link("[[growth-log]]"), "a.md", context());
+    expect(finding.class).toBe("external");
+    expect(finding.suggestion).toBeUndefined();
+  });
+
+  it(`classifies a dangling link marked ${PLANNED_MARKER} as planned`, () => {
+    const finding = classifyLink(
+      link(`- [[mvc-flux-and-state-management]] ${PLANNED_MARKER}`),
+      "a.md",
+      context()
+    );
+    expect(finding).toMatchObject({ class: "planned" });
+  });
+
+  it("lets the planned marker win over a rename suggestion", () => {
+    const finding = classifyLink(
+      link(`- [[react-reconcilation]] ${PLANNED_MARKER}`),
+      "a.md",
+      context()
+    );
+    expect(finding.class).toBe("planned");
+    expect(finding.suggestion).toBeUndefined();
+  });
+
+  it("reports a resolving link as ok even when the line carries the marker", () => {
+    const finding = classifyLink(
+      link(`- [[react-query]] ${PLANNED_MARKER}`),
+      "a.md",
+      context()
+    );
+    expect(finding.class).toBe("ok");
+  });
+
+  it("classifies a dangling link with a near match as renamed-candidate", () => {
+    const finding = classifyLink(link("[[react-reconcilation]]"), "a.md", context());
+    expect(finding).toMatchObject({
+      class: "renamed-candidate",
+      suggestion: "concepts/react/react-reconciliation",
+      suggestionSource: "basename-similarity",
+    });
+  });
+
+  it("classifies a dangling link with nothing to suggest as broken", () => {
+    const finding = classifyLink(link("[[totally-made-up-note]]"), "a.md", context());
+    expect(finding).toMatchObject({ class: "broken" });
+    expect(finding.suggestion).toBeUndefined();
+  });
+
+  it("carries the note path and line into the finding", () => {
+    const finding = classifyLink(link("\n\n[[nope-nothing-here]]"), "dir/a.md", context());
+    expect(finding).toMatchObject({ file: "dir/a.md", line: 3, vault: "tech" });
+  });
+});
+
+describe("summarize", () => {
+  it("counts every class, including the empty ones", () => {
+    const findings = [
+      classifyLink(link("[[react-query]]"), "a.md", context()),
+      classifyLink(link("[[stack-state]]"), "a.md", context()),
+      classifyLink(link("[[totally-made-up-note]]"), "a.md", context()),
+    ];
+    expect(summarize(findings)).toEqual({
+      ok: 1,
+      planned: 0,
+      external: 1,
+      "renamed-candidate": 0,
+      broken: 1,
+    });
   });
 });

@@ -1,338 +1,227 @@
-import { fromMarkdown } from "mdast-util-from-markdown";
-import { frontmatter } from "micromark-extension-frontmatter";
-import { frontmatterFromMarkdown } from "mdast-util-frontmatter";
+/**
+ * Wikilink scanning and rewriting.
+ *
+ * This is a character scanner, not a regex over the whole file: a naive
+ * `/\[\[(.+?)\]\]/g` would happily match links inside fenced code blocks, inline
+ * code spans and YAML frontmatter, all of which are documentation *about* links
+ * rather than links themselves. The vault has a live example — a checklist item
+ * reading "creates/updates notes with `[[wikilinks]]`" — that must not be
+ * reported as a broken link to a note named "wikilinks".
+ *
+ * Every link carries its byte offsets and its raw text exactly as written, which
+ * is what lets `rewriteWikilinks` swap a target while leaving the alias and
+ * heading parts byte-for-byte intact.
+ */
 
-export type LinkKind = "wikilink" | "wikilink_embed" | "markdown";
-
-export interface LinkRef {
-  kind: LinkKind;
+export type Wikilink = {
+  /** The link exactly as written, e.g. `[[a/b#H|Label]]`. */
   raw: string;
-  basename: string | null;
-  target: string | null;
-  alias: string | null;
-  heading: string | null;
-  blockId: string | null;
-  offset: number;
-  length: number;
+  /** Link target with the `#heading` and `|alias` parts stripped, trimmed. */
+  target: string;
+  /** Heading anchor without the `#`, when present. Preserved verbatim. */
+  heading?: string;
+  /** Alias without the `|`, when present. Preserved verbatim. */
+  alias?: string;
+  /** Offset of the opening `[[` in the source. */
+  start: number;
+  /** Offset just past the closing `]]`. */
+  end: number;
+  /** 1-based line number of the opening `[[`. */
   line: number;
+  /** 1-based column of the opening `[[`. */
   column: number;
+  /** The full source line the link sits on, for marker detection. */
+  lineText: string;
+};
+
+type Fence = { char: string; len: number };
+
+/** An opening (or closing) code fence: 3+ backticks or tildes, indented at most 3 spaces. */
+function fenceAt(line: string): Fence | undefined {
+  const match = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+  if (match === null) return undefined;
+  const run = match[1] as string;
+  return { char: run[0] as string, len: run.length };
 }
 
-export interface Edit {
-  offset: number;
-  length: number;
-  replacement: string;
+/** A fence closes a block only when it matches the opening char and carries no info string. */
+function closesFence(line: string, open: Fence): boolean {
+  const match = /^ {0,3}(`{3,}|~{3,})[ \t]*$/.exec(line);
+  if (match === null) return false;
+  const run = match[1] as string;
+  return (run[0] as string) === open.char && run.length >= open.len;
 }
 
-export interface LinkUpdate {
-  raw: string;
-  replacement: string;
-  line: number;
-  column: number;
+type ParsedInner = Pick<Wikilink, "target" | "heading" | "alias">;
+
+/**
+ * Split the inside of a `[[...]]` into target / heading / alias.
+ *
+ * Obsidian's order is `target#heading|alias`, so the pipe is found first and the
+ * hash is looked for only in what precedes it — otherwise an alias containing a
+ * `#` would be mistaken for a heading. Returns undefined for forms that don't
+ * name another note: `[[]]` and same-document anchors like `[[#Section]]`.
+ */
+function parseInner(inner: string): ParsedInner | undefined {
+  const pipe = inner.indexOf("|");
+  const beforePipe = pipe === -1 ? inner : inner.slice(0, pipe);
+  const alias = pipe === -1 ? undefined : inner.slice(pipe + 1);
+
+  const hash = beforePipe.indexOf("#");
+  const target = (hash === -1 ? beforePipe : beforePipe.slice(0, hash)).trim();
+  const heading = hash === -1 ? undefined : beforePipe.slice(hash + 1);
+
+  if (target === "") return undefined;
+  const parsed: ParsedInner = { target };
+  if (heading !== undefined) parsed.heading = heading;
+  if (alias !== undefined) parsed.alias = alias;
+  return parsed;
 }
 
-interface AstNode {
-  type: string;
-  position?: { start: { offset: number }; end: { offset: number } };
-  children?: AstNode[];
-  url?: string;
-  value?: string;
-}
+/**
+ * Every wikilink in `source` that is a real link, in document order.
+ *
+ * Skipped as not-links: YAML frontmatter, fenced code blocks, inline code spans,
+ * and same-document `[[#anchor]]` forms. Embeds (`![[x]]`) are reported — they do
+ * resolve to a target — with the leading `!` left outside `raw`, so rewriting an
+ * embed's target keeps it an embed.
+ *
+ * Inline code spans are matched within a single line. A code span left unclosed on
+ * its line is treated as literal backticks, which is where this diverges from
+ * CommonMark's multi-line spans; that shape doesn't occur in prose and the
+ * alternative (swallowing the rest of the file) is far worse.
+ */
+export function scanWikilinks(source: string): Wikilink[] {
+  const links: Wikilink[] = [];
+  const lines = source.split("\n");
 
-function parse(content: string): AstNode {
-  return fromMarkdown(content, {
-    extensions: [frontmatter(["yaml"])],
-    mdastExtensions: [frontmatterFromMarkdown(["yaml"])],
-  }) as AstNode;
-}
+  let offset = 0;
+  let fence: Fence | undefined;
+  let inFrontmatter = (lines[0] as string | undefined)?.trimEnd() === "---";
 
-export function scanLinks(content: string): LinkRef[] {
-  const tree = parse(content);
-  const refs: LinkRef[] = [];
-  const lineIndex = buildLineIndex(content);
-  visit(tree, content, refs, lineIndex);
-  refs.sort((a, b) => a.offset - b.offset);
-  return refs;
-}
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] as string;
+    const lineStart = offset;
+    offset += line.length + 1;
 
-function visit(
-  node: AstNode,
-  content: string,
-  refs: LinkRef[],
-  lineIndex: number[]
-): void {
-  if (!node) return;
-  switch (node.type) {
-    case "text":
-      if (node.position) {
-        scanWikilinksInRange(
-          content,
-          node.position.start.offset,
-          node.position.end.offset,
-          refs,
-          lineIndex
-        );
-      }
-      return;
-    case "link":
-      if (node.position && typeof node.url === "string") {
-        const offset = node.position.start.offset;
-        const length = node.position.end.offset - offset;
-        const lc = offsetToLineCol(offset, lineIndex);
-        refs.push({
-          kind: "markdown",
-          raw: content.slice(offset, offset + length),
-          basename: extractBasename(node.url),
-          target: node.url,
-          alias: null,
-          heading: null,
-          blockId: null,
-          offset,
-          length,
-          line: lc.line,
-          column: lc.column,
-        });
-      }
-      return;
-    case "code":
-    case "inlineCode":
-    case "yaml":
-    case "html":
-      return;
-    default:
-      if (Array.isArray(node.children)) {
-        for (const child of node.children) {
-          visit(child, content, refs, lineIndex);
-        }
-      }
-  }
-}
-
-function scanWikilinksInRange(
-  content: string,
-  start: number,
-  end: number,
-  refs: LinkRef[],
-  lineIndex: number[]
-): void {
-  let i = start;
-  while (i < end) {
-    const c = content[i];
-    if (c === "\\" && i + 1 < end) {
-      i += 2;
+    if (inFrontmatter) {
+      const trimmed = line.trimEnd();
+      if (i > 0 && (trimmed === "---" || trimmed === "...")) inFrontmatter = false;
       continue;
     }
-    if (c === "!" && content[i + 1] === "[" && content[i + 2] === "[") {
-      const close = findWikilinkClose(content, i + 3, end);
-      if (close !== -1) {
-        recordWikilink(content, i, close, "wikilink_embed", refs, lineIndex);
-        i = close + 2;
+
+    if (fence !== undefined) {
+      if (closesFence(line, fence)) fence = undefined;
+      continue;
+    }
+    const opening = fenceAt(line);
+    if (opening !== undefined) {
+      fence = opening;
+      continue;
+    }
+
+    let j = 0;
+    while (j < line.length) {
+      if (line[j] === "`") {
+        // Walk the opening backtick run, then look for a closing run of exactly
+        // the same length — that pair delimits an inline code span.
+        let runLength = 0;
+        while (line[j + runLength] === "`") runLength++;
+
+        let k = j + runLength;
+        let closeEnd = -1;
+        while (k < line.length) {
+          if (line[k] !== "`") {
+            k++;
+            continue;
+          }
+          let candidate = 0;
+          while (line[k + candidate] === "`") candidate++;
+          if (candidate === runLength) {
+            closeEnd = k + candidate;
+            break;
+          }
+          k += candidate;
+        }
+
+        j = closeEnd === -1 ? j + runLength : closeEnd;
         continue;
       }
-    }
-    if (c === "[" && content[i + 1] === "[") {
-      const close = findWikilinkClose(content, i + 2, end);
-      if (close !== -1) {
-        recordWikilink(content, i, close, "wikilink", refs, lineIndex);
-        i = close + 2;
+
+      if (line[j] === "[" && line[j + 1] === "[") {
+        const close = line.indexOf("]]", j + 2);
+        if (close === -1) {
+          j += 2;
+          continue;
+        }
+        const parsed = parseInner(line.slice(j + 2, close));
+        if (parsed !== undefined) {
+          links.push({
+            ...parsed,
+            raw: line.slice(j, close + 2),
+            start: lineStart + j,
+            end: lineStart + close + 2,
+            line: i + 1,
+            column: j + 1,
+            lineText: line,
+          });
+        }
+        j = close + 2;
         continue;
       }
-    }
-    i++;
-  }
-}
 
-function findWikilinkClose(content: string, from: number, end: number): number {
-  for (let i = from; i < end - 1; i++) {
-    const c = content[i];
-    if (c === "\n") return -1;
-    if (c === "[" && content[i + 1] === "[") return -1;
-    if (c === "]" && content[i + 1] === "]") return i;
-  }
-  return -1;
-}
-
-function recordWikilink(
-  content: string,
-  startBracket: number,
-  closeBracket: number,
-  kind: LinkKind,
-  refs: LinkRef[],
-  lineIndex: number[]
-): void {
-  const prefixLen = kind === "wikilink_embed" ? 3 : 2;
-  const inner = content.slice(startBracket + prefixLen, closeBracket);
-  const parsed = parseWikilinkInner(inner);
-  const length = closeBracket + 2 - startBracket;
-  const lc = offsetToLineCol(startBracket, lineIndex);
-  refs.push({
-    kind,
-    raw: content.slice(startBracket, startBracket + length),
-    basename: parsed.basename,
-    target: parsed.target,
-    alias: parsed.alias,
-    heading: parsed.heading,
-    blockId: parsed.blockId,
-    offset: startBracket,
-    length,
-    line: lc.line,
-    column: lc.column,
-  });
-}
-
-interface ParsedInner {
-  basename: string;
-  target: string;
-  alias: string | null;
-  heading: string | null;
-  blockId: string | null;
-}
-
-function parseWikilinkInner(inner: string): ParsedInner {
-  let target = inner;
-  let alias: string | null = null;
-  const pipeIdx = inner.indexOf("|");
-  if (pipeIdx !== -1) {
-    target = inner.slice(0, pipeIdx);
-    alias = inner.slice(pipeIdx + 1);
-  }
-  let basePath = target;
-  let heading: string | null = null;
-  let blockId: string | null = null;
-  const hashIdx = target.indexOf("#");
-  if (hashIdx !== -1) {
-    basePath = target.slice(0, hashIdx);
-    const fragment = target.slice(hashIdx + 1);
-    if (fragment.startsWith("^")) {
-      blockId = fragment.slice(1);
-    } else {
-      heading = fragment;
+      j++;
     }
   }
-  let basename = basePath;
-  const lastSlash = basename.lastIndexOf("/");
-  if (lastSlash !== -1) basename = basename.slice(lastSlash + 1);
-  if (basename.endsWith(".md")) basename = basename.slice(0, -3);
-  return { basename, target, alias, heading, blockId };
+
+  return links;
 }
 
-function extractBasename(url: string): string | null {
-  const cleaned = url.split("#")[0]?.split("?")[0] ?? "";
-  if (!cleaned.endsWith(".md")) return null;
-  const lastSlash = cleaned.lastIndexOf("/");
-  const fname = lastSlash !== -1 ? cleaned.slice(lastSlash + 1) : cleaned;
-  return decodeURIComponent(fname.slice(0, -3));
-}
-
-function buildLineIndex(content: string): number[] {
-  const idx: number[] = [0];
-  for (let i = 0; i < content.length; i++) {
-    if (content[i] === "\n") idx.push(i + 1);
-  }
-  return idx;
-}
-
-function offsetToLineCol(
-  offset: number,
-  lineIndex: number[]
-): { line: number; column: number } {
-  let lo = 0;
-  let hi = lineIndex.length - 1;
-  while (lo < hi) {
-    const mid = (lo + hi + 1) >>> 1;
-    if (lineIndex[mid]! <= offset) lo = mid;
-    else hi = mid - 1;
-  }
-  return { line: lo + 1, column: offset - lineIndex[lo]! + 1 };
-}
-
-export function rewriteWikilinks(
-  content: string,
-  fromBasename: string,
-  toBasename: string
-): { content: string; updates: LinkUpdate[] } {
-  if (fromBasename === toBasename) return { content, updates: [] };
-  const refs = scanLinks(content);
-  const edits: Edit[] = [];
-  const updates: LinkUpdate[] = [];
-  for (const ref of refs) {
-    if (ref.kind !== "wikilink" && ref.kind !== "wikilink_embed") continue;
-    if (ref.basename !== fromBasename) continue;
-    const prefix = ref.kind === "wikilink_embed" ? "![[" : "[[";
-    let body = toBasename;
-    if (ref.heading) body += "#" + ref.heading;
-    if (ref.blockId) body += "#^" + ref.blockId;
-    if (ref.alias !== null) body += "|" + ref.alias;
-    const replacement = prefix + body + "]]";
-    edits.push({ offset: ref.offset, length: ref.length, replacement });
-    updates.push({
-      raw: ref.raw,
-      replacement,
-      line: ref.line,
-      column: ref.column,
-    });
-  }
-  return { content: applyEdits(content, edits), updates };
-}
-
-export function rewriteMarkdownLinks(
-  content: string,
-  predicate: (url: string) => string | null
-): { content: string; updates: LinkUpdate[] } {
-  const refs = scanLinks(content);
-  const edits: Edit[] = [];
-  const updates: LinkUpdate[] = [];
-  for (const ref of refs) {
-    if (ref.kind !== "markdown" || !ref.target) continue;
-    const newUrl = predicate(ref.target);
-    if (newUrl === null || newUrl === ref.target) continue;
-    const closeBracket = ref.raw.indexOf("](");
-    if (closeBracket === -1) continue;
-    const text = ref.raw.slice(1, closeBracket);
-    const replacement = `[${text}](${newUrl})`;
-    edits.push({ offset: ref.offset, length: ref.length, replacement });
-    updates.push({
-      raw: ref.raw,
-      replacement,
-      line: ref.line,
-      column: ref.column,
-    });
-  }
-  return { content: applyEdits(content, edits), updates };
-}
-
-export function applyEdits(content: string, edits: Edit[]): string {
-  if (edits.length === 0) return content;
-  const sorted = [...edits].sort((a, b) => a.offset - b.offset);
-  for (let i = 1; i < sorted.length; i++) {
-    const prev = sorted[i - 1]!;
-    const cur = sorted[i]!;
-    if (cur.offset < prev.offset + prev.length) {
-      throw new Error("overlapping edits");
-    }
-  }
-  let result = content;
-  for (let i = sorted.length - 1; i >= 0; i--) {
-    const edit = sorted[i]!;
-    result =
-      result.slice(0, edit.offset) +
-      edit.replacement +
-      result.slice(edit.offset + edit.length);
-  }
-  return result;
-}
-
-export function contextSnippet(
-  content: string,
-  offset: number,
-  length: number,
-  width = 80
+/** Render a link back to source form, keeping the heading and alias parts as given. */
+export function renderWikilink(
+  target: string,
+  heading?: string,
+  alias?: string
 ): string {
-  const pad = Math.max(0, Math.floor((width - length) / 2));
-  const start = Math.max(0, offset - pad);
-  const end = Math.min(content.length, start + width);
-  let snippet = content.slice(start, end).replace(/\n/g, " ");
-  if (start > 0) snippet = "..." + snippet;
-  if (end < content.length) snippet = snippet + "...";
-  return snippet;
+  let inner = target;
+  if (heading !== undefined) inner += `#${heading}`;
+  if (alias !== undefined) inner += `|${alias}`;
+  return `[[${inner}]]`;
+}
+
+export type LinkRewrite = {
+  link: Wikilink;
+  /** The replacement link text. */
+  to: string;
+};
+
+/**
+ * Rewrite link targets in `source`.
+ *
+ * `retarget` receives each scanned link and returns the new target, or undefined
+ * to leave that link alone. Only the target changes: the heading and alias travel
+ * through `renderWikilink` untouched, so `[[old|Some Label]]` becomes
+ * `[[new|Some Label]]` rather than silently losing the label.
+ *
+ * Splices run back to front so each link's recorded offsets stay valid.
+ */
+export function rewriteWikilinks(
+  source: string,
+  retarget: (link: Wikilink) => string | undefined
+): { content: string; changes: LinkRewrite[] } {
+  const links = scanWikilinks(source);
+  const changes: LinkRewrite[] = [];
+
+  let content = source;
+  for (let i = links.length - 1; i >= 0; i--) {
+    const link = links[i] as Wikilink;
+    const target = retarget(link);
+    if (target === undefined || target === link.target) continue;
+
+    const to = renderWikilink(target, link.heading, link.alias);
+    content = content.slice(0, link.start) + to + content.slice(link.end);
+    changes.unshift({ link, to });
+  }
+
+  return { content, changes };
 }

@@ -1,311 +1,163 @@
 import { describe, it, expect } from "vitest";
-import {
-  scanLinks,
-  rewriteWikilinks,
-  rewriteMarkdownLinks,
-  applyEdits,
-  contextSnippet,
-} from "./wikilinks.js";
+import { scanWikilinks, rewriteWikilinks, renderWikilink } from "./wikilinks.js";
 
-describe("scanLinks — wikilinks", () => {
-  it("detects a plain wikilink", () => {
-    const refs = scanLinks("see [[foo]] here");
-    expect(refs).toHaveLength(1);
-    const ref = refs[0]!;
-    expect(ref.kind).toBe("wikilink");
-    expect(ref.basename).toBe("foo");
-    expect(ref.target).toBe("foo");
-    expect(ref.alias).toBeNull();
-    expect(ref.heading).toBeNull();
-    expect(ref.blockId).toBeNull();
-    expect(ref.raw).toBe("[[foo]]");
-    expect(ref.line).toBe(1);
-    expect(ref.column).toBe(5);
-  });
+const targets = (source: string): string[] => scanWikilinks(source).map((l) => l.target);
 
-  it("detects an embed", () => {
-    const refs = scanLinks("![[foo]]");
-    expect(refs).toHaveLength(1);
-    expect(refs[0]!.kind).toBe("wikilink_embed");
-    expect(refs[0]!.basename).toBe("foo");
-    expect(refs[0]!.raw).toBe("![[foo]]");
-  });
-
-  it("parses aliased wikilink", () => {
-    const refs = scanLinks("[[foo|display text]]");
-    expect(refs[0]!.basename).toBe("foo");
-    expect(refs[0]!.alias).toBe("display text");
-  });
-
-  it("parses heading reference", () => {
-    const refs = scanLinks("[[foo#Some Heading]]");
-    expect(refs[0]!.basename).toBe("foo");
-    expect(refs[0]!.heading).toBe("Some Heading");
-    expect(refs[0]!.blockId).toBeNull();
-  });
-
-  it("parses block reference", () => {
-    const refs = scanLinks("[[foo#^abc123]]");
-    expect(refs[0]!.basename).toBe("foo");
-    expect(refs[0]!.blockId).toBe("abc123");
-    expect(refs[0]!.heading).toBeNull();
-  });
-
-  it("parses heading + alias together", () => {
-    const refs = scanLinks("[[foo#Heading|alt]]");
-    expect(refs[0]!.basename).toBe("foo");
-    expect(refs[0]!.heading).toBe("Heading");
-    expect(refs[0]!.alias).toBe("alt");
-  });
-
-  it("strips path prefix from wikilink target to derive basename", () => {
-    const refs = scanLinks("[[folder/note]]");
-    expect(refs[0]!.basename).toBe("note");
-    expect(refs[0]!.target).toBe("folder/note");
-  });
-
-  it("strips .md suffix from wikilink target", () => {
-    const refs = scanLinks("[[note.md]]");
-    expect(refs[0]!.basename).toBe("note");
-  });
-
-  it("detects multiple wikilinks on one line", () => {
-    const refs = scanLinks("see [[a]] and [[b]] together");
-    expect(refs).toHaveLength(2);
-    expect(refs[0]!.basename).toBe("a");
-    expect(refs[1]!.basename).toBe("b");
-  });
-
-  it("detects adjacent wikilinks with no separator", () => {
-    const refs = scanLinks("[[a]][[b]]");
-    expect(refs).toHaveLength(2);
-  });
-});
-
-describe("scanLinks — markdown links", () => {
-  it("detects markdown link to .md file", () => {
-    const refs = scanLinks("[label](./folder/note.md)");
-    expect(refs).toHaveLength(1);
-    const ref = refs[0]!;
-    expect(ref.kind).toBe("markdown");
-    expect(ref.target).toBe("./folder/note.md");
-    expect(ref.basename).toBe("note");
-  });
-
-  it("includes non-md markdown links but marks basename null", () => {
-    const refs = scanLinks("[home](https://example.com)");
-    expect(refs).toHaveLength(1);
-    expect(refs[0]!.kind).toBe("markdown");
-    expect(refs[0]!.target).toBe("https://example.com");
-    expect(refs[0]!.basename).toBeNull();
-  });
-
-  it("decodes percent-escaped basenames", () => {
-    const refs = scanLinks("[x](./folder/some%20note.md)");
-    expect(refs[0]!.basename).toBe("some note");
-  });
-});
-
-describe("scanLinks — exclusions", () => {
-  it("ignores wikilinks inside inline code", () => {
-    const refs = scanLinks("text `[[foo]]` more");
-    expect(refs).toHaveLength(0);
-  });
-
-  it("ignores wikilinks inside fenced code blocks", () => {
-    const refs = scanLinks("text\n```\n[[foo]]\n```\nafter");
-    expect(refs).toHaveLength(0);
-  });
-
-  it("ignores wikilinks inside tilde-fenced code blocks", () => {
-    const refs = scanLinks("text\n~~~\n[[foo]]\n~~~\nafter");
-    expect(refs).toHaveLength(0);
-  });
-
-  it("ignores wikilinks inside indented code blocks", () => {
-    const refs = scanLinks("text\n\n    [[foo]]\n\nafter");
-    expect(refs).toHaveLength(0);
-  });
-
-  it("ignores wikilinks inside YAML frontmatter", () => {
-    const refs = scanLinks(
-      "---\ntitle: \"[[foo]]\"\ntags: [bar]\n---\nbody [[real]]"
+describe("scanWikilinks", () => {
+  it("reads the four shapes a link to one note can take", () => {
+    const links = scanWikilinks(
+      "[[bare]]\n[[mobile/prefixed]]\n[[aliased|Some Label]]\n[[anchored#Some Heading]]\n"
     );
-    expect(refs).toHaveLength(1);
-    expect(refs[0]!.basename).toBe("real");
+    expect(links.map((l) => [l.target, l.alias, l.heading])).toEqual([
+      ["bare", undefined, undefined],
+      ["mobile/prefixed", undefined, undefined],
+      ["aliased", "Some Label", undefined],
+      ["anchored", undefined, "Some Heading"],
+    ]);
   });
 
-  it("ignores escaped brackets", () => {
-    const refs = scanLinks("text \\[\\[foo\\]\\] more");
-    expect(refs).toHaveLength(0);
+  it("keeps the alias when the heading and alias are combined", () => {
+    const [link] = scanWikilinks("[[note#Heading|Label]]");
+    expect(link).toMatchObject({ target: "note", heading: "Heading", alias: "Label" });
   });
 
-  it("does not span newlines inside a wikilink", () => {
-    const refs = scanLinks("[[foo\nbar]]");
-    expect(refs).toHaveLength(0);
+  it("treats a pipe inside an alias as part of the alias, not a heading", () => {
+    const [link] = scanWikilinks("[[note|A # B]]");
+    expect(link).toMatchObject({ target: "note", alias: "A # B" });
+    expect(link?.heading).toBeUndefined();
+  });
+
+  it("reports line numbers and the raw text as written", () => {
+    const links = scanWikilinks("intro\n\nsee [[a/b|C]] here\n");
+    expect(links).toHaveLength(1);
+    expect(links[0]).toMatchObject({ line: 3, column: 5, raw: "[[a/b|C]]" });
+  });
+
+  // The live case: tech/patterns/karpathys-llm-knowledge-base-pattern.md documents
+  // the pattern using a code span, and must not be read as a link to "wikilinks".
+  it("ignores links inside an inline code span", () => {
+    expect(
+      targets("- [x] Compile flow: agent creates/updates notes with `[[wikilinks]]`\n")
+    ).toEqual([]);
+  });
+
+  it("still reads a real link on a line that also has a code span", () => {
+    expect(targets("`[[not-a-link]]` but [[a-real-one]] counts")).toEqual(["a-real-one"]);
+  });
+
+  it("handles double-backtick spans that themselves contain a backtick", () => {
+    expect(targets("``code with ` and [[nope]]`` then [[yes]]")).toEqual(["yes"]);
+  });
+
+  it("treats an unclosed backtick as literal rather than swallowing the line", () => {
+    expect(targets("a ` stray tick and [[still-a-link]]")).toEqual(["still-a-link"]);
+  });
+
+  it("ignores links inside a fenced code block", () => {
+    const source = ["before [[one]]", "```md", "[[inside-fence]]", "```", "after [[two]]"].join(
+      "\n"
+    );
+    expect(targets(source)).toEqual(["one", "two"]);
+  });
+
+  it("ignores links in a tilde fence and in an indented fence", () => {
+    const source = ["~~~", "[[tilde]]", "~~~", "   ```", "   [[indented]]", "   ```", "[[kept]]"].join(
+      "\n"
+    );
+    expect(targets(source)).toEqual(["kept"]);
+  });
+
+  it("does not let a shorter inner fence close a longer block", () => {
+    const source = ["````", "```", "[[hidden]]", "```", "````", "[[kept]]"].join("\n");
+    expect(targets(source)).toEqual(["kept"]);
+  });
+
+  it("ignores links in YAML frontmatter", () => {
+    const source = ["---", "title: A", "related: [[frontmatter-link]]", "---", "[[body-link]]"].join(
+      "\n"
+    );
+    expect(targets(source)).toEqual(["body-link"]);
+  });
+
+  it("does not mistake a horizontal rule mid-document for frontmatter", () => {
+    expect(targets("intro\n\n---\n\n[[after-rule]]\n")).toEqual(["after-rule"]);
+  });
+
+  it("skips same-document anchors and empty links", () => {
+    expect(targets("[[#Section]] and [[]] and [[real]]")).toEqual(["real"]);
+  });
+
+  it("reports an embed's target, leaving the bang outside the raw text", () => {
+    const [link] = scanWikilinks("![[diagram]]");
+    expect(link).toMatchObject({ target: "diagram", raw: "[[diagram]]" });
+  });
+
+  it("trims whitespace around a target but keeps the alias verbatim", () => {
+    const [link] = scanWikilinks("[[  spaced  |  Label  ]]");
+    expect(link).toMatchObject({ target: "spaced", alias: "  Label  " });
   });
 });
 
-describe("scanLinks — positions", () => {
-  it("reports correct line and column on multi-line input", () => {
-    const refs = scanLinks("line one\nline two has [[link]] in it\nline three");
-    expect(refs[0]!.line).toBe(2);
-    expect(refs[0]!.column).toBe(14);
-  });
-
-  it("handles unicode characters before the link", () => {
-    const content = "🎉 see [[foo]]";
-    const refs = scanLinks(content);
-    expect(refs).toHaveLength(1);
-    const ref = refs[0]!;
-    expect(content.slice(ref.offset, ref.offset + ref.length)).toBe("[[foo]]");
-  });
-
-  it("offsets are sorted ascending", () => {
-    const refs = scanLinks("[[c]] [[a]] [[b]]");
-    expect(refs.map((r) => r.basename)).toEqual(["c", "a", "b"]);
-    expect(refs[0]!.offset).toBeLessThan(refs[1]!.offset);
-    expect(refs[1]!.offset).toBeLessThan(refs[2]!.offset);
+describe("renderWikilink", () => {
+  it("rebuilds each shape", () => {
+    expect(renderWikilink("a")).toBe("[[a]]");
+    expect(renderWikilink("a", "H")).toBe("[[a#H]]");
+    expect(renderWikilink("a", undefined, "L")).toBe("[[a|L]]");
+    expect(renderWikilink("a", "H", "L")).toBe("[[a#H|L]]");
   });
 });
 
 describe("rewriteWikilinks", () => {
-  it("rewrites a plain wikilink target", () => {
-    const out = rewriteWikilinks("see [[old]] now", "old", "new");
-    expect(out.content).toBe("see [[new]] now");
-    expect(out.updates).toHaveLength(1);
-    expect(out.updates[0]!.replacement).toBe("[[new]]");
+  const swap = (from: string, to: string) => (link: { target: string }) =>
+    link.target === from ? to : undefined;
+
+  it("preserves the alias when retargeting", () => {
+    const { content } = rewriteWikilinks("see [[old|Some Label]] here", swap("old", "new"));
+    expect(content).toBe("see [[new|Some Label]] here");
   });
 
-  it("preserves alias", () => {
-    const out = rewriteWikilinks("[[old|display]]", "old", "new");
-    expect(out.content).toBe("[[new|display]]");
+  it("preserves the heading when retargeting", () => {
+    const { content } = rewriteWikilinks("see [[old#Section]] here", swap("old", "new"));
+    expect(content).toBe("see [[new#Section]] here");
   });
 
-  it("preserves heading", () => {
-    const out = rewriteWikilinks("[[old#Heading]]", "old", "new");
-    expect(out.content).toBe("[[new#Heading]]");
+  it("preserves a combined heading and alias", () => {
+    const { content } = rewriteWikilinks("[[old#Section|Label]]", swap("old", "new"));
+    expect(content).toBe("[[new#Section|Label]]");
   });
 
-  it("preserves block id", () => {
-    const out = rewriteWikilinks("[[old#^id]]", "old", "new");
-    expect(out.content).toBe("[[new#^id]]");
-  });
-
-  it("preserves combined heading + alias", () => {
-    const out = rewriteWikilinks("[[old#H|alt]]", "old", "new");
-    expect(out.content).toBe("[[new#H|alt]]");
-  });
-
-  it("rewrites embeds", () => {
-    const out = rewriteWikilinks("![[old]]", "old", "new");
-    expect(out.content).toBe("![[new]]");
-  });
-
-  it("leaves unrelated wikilinks alone", () => {
-    const out = rewriteWikilinks("[[other]] [[old]]", "old", "new");
-    expect(out.content).toBe("[[other]] [[new]]");
-  });
-
-  it("preserves surrounding bytes exactly outside the rewritten spans", () => {
-    const content = "  weird   whitespace\n\n\n[[old]]\t\tand more\n";
-    const out = rewriteWikilinks(content, "old", "new");
-    expect(out.content).toBe("  weird   whitespace\n\n\n[[new]]\t\tand more\n");
-  });
-
-  it("is a no-op when from === to", () => {
-    const out = rewriteWikilinks("[[same]]", "same", "same");
-    expect(out.content).toBe("[[same]]");
-    expect(out.updates).toEqual([]);
-  });
-
-  it("skips wikilinks in code", () => {
-    const out = rewriteWikilinks("real [[old]] code `[[old]]`", "old", "new");
-    expect(out.content).toBe("real [[new]] code `[[old]]`");
-  });
-
-  it("rewrites multiple occurrences on one line", () => {
-    const out = rewriteWikilinks("[[old]] then [[old]]", "old", "new");
-    expect(out.content).toBe("[[new]] then [[new]]");
-    expect(out.updates).toHaveLength(2);
-  });
-});
-
-describe("rewriteMarkdownLinks", () => {
-  it("rewrites a markdown link URL when predicate returns a new value", () => {
-    const out = rewriteMarkdownLinks(
-      "[x](./old.md)",
-      (url) => (url === "./old.md" ? "./new.md" : null)
+  it("rewrites a folder-prefixed link to the new target", () => {
+    const { content } = rewriteWikilinks(
+      "[[work/mobile/old]]",
+      swap("work/mobile/old", "new")
     );
-    expect(out.content).toBe("[x](./new.md)");
+    expect(content).toBe("[[new]]");
   });
 
-  it("leaves link untouched when predicate returns null", () => {
-    const out = rewriteMarkdownLinks("[x](./old.md)", () => null);
-    expect(out.content).toBe("[x](./old.md)");
-    expect(out.updates).toEqual([]);
-  });
-
-  it("preserves link text including brackets-like content", () => {
-    const out = rewriteMarkdownLinks(
-      "[a (with parens) b](./x.md)",
-      () => "./y.md"
+  it("rewrites every occurrence on one line without corrupting offsets", () => {
+    const { content, changes } = rewriteWikilinks(
+      "[[old]] then [[old|A]] then [[old#B]]",
+      swap("old", "renamed-note")
     );
-    expect(out.content).toBe("[a (with parens) b](./y.md)");
-  });
-});
-
-describe("applyEdits", () => {
-  it("returns input unchanged for empty edits", () => {
-    expect(applyEdits("hello", [])).toBe("hello");
+    expect(content).toBe("[[renamed-note]] then [[renamed-note|A]] then [[renamed-note#B]]");
+    expect(changes).toHaveLength(3);
   });
 
-  it("applies non-overlapping edits", () => {
-    const out = applyEdits("aaa bbb ccc", [
-      { offset: 0, length: 3, replacement: "AAA" },
-      { offset: 8, length: 3, replacement: "CCC" },
-    ]);
-    expect(out).toBe("AAA bbb CCC");
+  it("leaves links in code untouched even when they match", () => {
+    const source = ["`[[old]]`", "```", "[[old]]", "```", "[[old]]"].join("\n");
+    const { content, changes } = rewriteWikilinks(source, swap("old", "new"));
+    expect(content).toBe(["`[[old]]`", "```", "[[old]]", "```", "[[new]]"].join("\n"));
+    expect(changes).toHaveLength(1);
   });
 
-  it("throws on overlapping edits", () => {
-    expect(() =>
-      applyEdits("aaaa", [
-        { offset: 0, length: 2, replacement: "x" },
-        { offset: 1, length: 2, replacement: "y" },
-      ])
-    ).toThrow("overlapping edits");
+  it("reports no changes when the target is unchanged", () => {
+    const { content, changes } = rewriteWikilinks("[[same]]", swap("same", "same"));
+    expect(changes).toEqual([]);
+    expect(content).toBe("[[same]]");
   });
 
-  it("throws on adjacent-but-overlapping zero-length edge case", () => {
-    expect(() =>
-      applyEdits("aaa", [
-        { offset: 0, length: 2, replacement: "x" },
-        { offset: 1, length: 1, replacement: "y" },
-      ])
-    ).toThrow("overlapping edits");
-  });
-
-  it("handles edits given in any order", () => {
-    const out = applyEdits("aaa bbb ccc", [
-      { offset: 8, length: 3, replacement: "CCC" },
-      { offset: 0, length: 3, replacement: "AAA" },
-    ]);
-    expect(out).toBe("AAA bbb CCC");
-  });
-});
-
-describe("contextSnippet", () => {
-  it("returns content around the offset", () => {
-    const content = "a".repeat(50) + "[[link]]" + "b".repeat(50);
-    const snippet = contextSnippet(content, 50, 8, 40);
-    expect(snippet).toContain("[[link]]");
-    expect(snippet).toContain("...");
-  });
-
-  it("replaces newlines with spaces", () => {
-    const snippet = contextSnippet("foo\nbar\nbaz", 4, 3, 20);
-    expect(snippet).not.toContain("\n");
-    expect(snippet).toContain("bar");
+  it("returns changes in document order with their line numbers", () => {
+    const { changes } = rewriteWikilinks("[[old]]\n\n[[old]]", swap("old", "new"));
+    expect(changes.map((c) => c.link.line)).toEqual([1, 3]);
   });
 });
