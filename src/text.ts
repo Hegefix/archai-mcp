@@ -7,8 +7,14 @@ export function toKebabCase(title: string): string {
     .replace(/^-|-$/g, "");
 }
 
+/**
+ * Local calendar date, not UTC: a note saved at 01:00 CEST belongs to that day,
+ * not to the previous one.
+ */
 export function todayISO(): string {
-  return new Date().toISOString().split("T")[0] as string;
+  const now = new Date();
+  const local = new Date(now.getTime() - now.getTimezoneOffset() * 60_000);
+  return local.toISOString().split("T")[0] as string;
 }
 
 export type VaultFolderInfo = {

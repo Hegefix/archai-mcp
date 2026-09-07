@@ -150,6 +150,73 @@ describe("MCP tools", () => {
       expect(parsed.content.trim()).toBe("Hello world");
     });
 
+    it("refuses to overwrite an existing note even with force", async () => {
+      await callTool("save", {
+        title: "Overwrite Me",
+        content: "original",
+        folder: "notes",
+        allowNewTopLevel: true,
+        force: true,
+      });
+      const result = await callTool("save", {
+        title: "Overwrite Me",
+        content: "replacement",
+        folder: "notes",
+        allowNewTopLevel: true,
+        force: true,
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("already exists");
+
+      const raw = await readFile(join(vaultPath, "notes/overwrite-me.md"), "utf-8");
+      expect(matter(raw).content.trim()).toBe("original");
+    });
+
+    it("refuses a basename that already exists in another folder", async () => {
+      await callTool("save", {
+        title: "Shared Name",
+        content: "first",
+        folder: "notes",
+        allowNewTopLevel: true,
+        force: true,
+      });
+      const result = await callTool("save", {
+        title: "Shared Name",
+        content: "second",
+        folder: "other",
+        allowNewTopLevel: true,
+        force: true,
+      });
+      expect(result.isError).toBe(true);
+      expect(getText(result)).toContain("Basenames must be unique");
+    });
+
+    it("warns only when an existing note contains every word of the title", async () => {
+      await callTool("save", {
+        title: "Redis Distributed Locks And Leases",
+        content: "original",
+        folder: "notes",
+        allowNewTopLevel: true,
+        force: true,
+      });
+
+      const dup = await callTool("save", {
+        title: "Redis Distributed Locks",
+        content: "another",
+        folder: "notes",
+        allowNewTopLevel: true,
+      });
+      expect(getText(dup)).toContain("Redis Distributed Locks And Leases");
+
+      const unrelated = await callTool("save", {
+        title: "Kafka Consumer Groups",
+        content: "unrelated",
+        folder: "notes",
+        allowNewTopLevel: true,
+      });
+      expect(getText(unrelated)).toContain("notes/kafka-consumer-groups.md");
+    });
+
     it("creates tags in frontmatter", async () => {
       await callTool("save", {
         title: "Tagged Note",
@@ -324,6 +391,22 @@ describe("MCP tools", () => {
       const text = getText(result);
       expect(text).toContain("Note A");
       expect(text).toContain("Note B");
+    });
+
+    it("filters on folder boundaries, not raw prefixes", async () => {
+      await callTool("save", {
+        title: "Scifi Note",
+        content: "Setting",
+        folder: "scifi",
+        allowNewTopLevel: true,
+        force: true,
+      });
+
+      const partial = await callTool("list", { folder: "sci" });
+      expect(getText(partial)).toBe("No notes found.");
+
+      const exact = await callTool("list", { folder: "scifi" });
+      expect(getText(exact)).toContain("Scifi Note");
     });
 
     it("filters by folder", async () => {

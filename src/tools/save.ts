@@ -1,13 +1,14 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v3";
 import matter from "gray-matter";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { writeFile, mkdir, access } from "node:fs/promises";
+import { join, dirname, posix } from "node:path";
 import {
   normalizeVaultPath,
   resolveVaultPath,
   getAllMarkdownFiles,
   assertKnownTopLevelFolder,
+  readNoteOrNull,
 } from "../paths.js";
 import { type VaultRegistry, resolveVault, isLogEnabled } from "../vaults.js";
 import {
@@ -28,6 +29,15 @@ import {
 } from "../frontmatter.js";
 
 const CYRILLIC_RE = /[Ѐ-ӿ]/;
+
+async function exists(fullPath: string): Promise<boolean> {
+  try {
+    await access(fullPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 export function registerSave(
   server: McpServer,
@@ -171,25 +181,24 @@ export function registerSave(
           if (filePath === LOG_FILE) continue;
 
           const fileName = filePath.toLowerCase();
-          const filenameMatch = titleWords.some((w) => fileName.includes(w));
+          const fileContent = await readNoteOrNull(
+            resolveVaultPath(vaultPath, filePath)
+          );
+          if (fileContent === null) continue;
+          const lowerContent = fileContent.toLowerCase();
 
-          let contentMatch = false;
-          let snippet = "";
-          if (filenameMatch || titleWords.length > 0) {
-            const fullPath = resolveVaultPath(vaultPath, filePath);
-            const fileContent = await readFile(fullPath, "utf-8");
-            const lowerContent = fileContent.toLowerCase();
-            contentMatch = titleWords.some((w) => lowerContent.includes(w));
-            if (filenameMatch || contentMatch) {
-              snippet = extractBestSnippet(fileContent, titleWords);
-            }
-          }
+          // Every significant word must appear, in the filename or the body.
+          // Matching on *any* word made a three-word title collide with most of
+          // the vault, so every save needed force=true to get through.
+          const allPresent = titleWords.every(
+            (w) => fileName.includes(w) || lowerContent.includes(w)
+          );
+          if (!allPresent) continue;
 
-          if (filenameMatch || contentMatch) {
-            matches.push({ path: filePath, snippet });
-          }
-
-          if (matches.length >= 5) break;
+          matches.push({
+            path: filePath,
+            snippet: extractBestSnippet(fileContent, titleWords),
+          });
         }
 
         if (matches.length > 0) {
@@ -225,6 +234,39 @@ export function registerSave(
       const filename = toKebabCase(title) + ".md";
       const relativePath = join(targetFolder, filename);
       const fullPath = resolveVaultPath(vaultPath, relativePath);
+
+      if (await exists(fullPath)) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error: ${relativePath} already exists. Use update to change it, or pick a different title.`,
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      // Links are kebab-basename, so two notes sharing a basename make every
+      // [[link]] to either one ambiguous. Blocked regardless of force.
+      const existingFiles = await getAllMarkdownFiles(vaultPath);
+      const basenameClash = existingFiles.find(
+        (f) => posix.basename(f) === filename
+      );
+      if (basenameClash !== undefined) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Error: a note named ${filename} already exists at ${basenameClash}. ` +
+                `Basenames must be unique — [[${toKebabCase(title)}]] would be ambiguous. ` +
+                `Pick a different title.`,
+            },
+          ],
+          isError: true,
+        };
+      }
 
       const today = todayISO();
       const frontmatter: Record<string, unknown> = {

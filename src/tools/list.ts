@@ -1,8 +1,12 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v3";
 import matter from "gray-matter";
-import { readFile } from "node:fs/promises";
-import { resolveVaultPath, getAllMarkdownFiles } from "../paths.js";
+import {
+  normalizeVaultPath,
+  resolveVaultPath,
+  getAllMarkdownFiles,
+  readNoteOrNull,
+} from "../paths.js";
 import { type VaultRegistry, resolveVault } from "../vaults.js";
 import { describeVaultLayouts, firstTopLevelFolder, type VaultFolderInfo } from "../text.js";
 
@@ -20,12 +24,19 @@ async function listVault(
   folder?: string
 ): Promise<ListEntry[]> {
   const files = await getAllMarkdownFiles(vaultPath);
-  const filtered = folder ? files.filter((f) => f.startsWith(folder)) : files;
+  // Compare on a segment boundary: a raw prefix match would let folder "sci"
+  // pull in everything under "scifi/".
+  const prefix = folder === undefined ? undefined : normalizeVaultPath(folder);
+  const filtered =
+    prefix === undefined || prefix === "."
+      ? files
+      : files.filter((f) => f === prefix || f.startsWith(`${prefix}/`));
 
   const entries: ListEntry[] = [];
   for (const filePath of filtered) {
     const fullPath = resolveVaultPath(vaultPath, filePath);
-    const fileContent = await readFile(fullPath, "utf-8");
+    const fileContent = await readNoteOrNull(fullPath);
+    if (fileContent === null) continue;
     const parsed = matter(fileContent);
 
     entries.push({
