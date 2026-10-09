@@ -3,14 +3,18 @@ import { z } from "zod/v3";
 import { stat } from "node:fs/promises";
 import { posix } from "node:path";
 import matter from "gray-matter";
-import { normalizeVaultPath, resolveVaultPath, assertKnownTopLevelFolder } from "../paths.js";
+import {
+  normalizeVaultPath,
+  resolveVaultPath,
+  assertKnownTopLevelFolder,
+  REFERENCES_DIR,
+} from "../paths.js";
 import { type VaultRegistry, resolveVault, isLogEnabled } from "../vaults.js";
 import { describeVaultLayouts, firstTopLevelFolder, toKebabCase, type VaultFolderInfo } from "../text.js";
 import { gitMove, stageVault } from "../git.js";
 import { afterWrite } from "../hooks.js";
 import { createJournal } from "../rollback.js";
 import { LOG_FILE } from "../log.js";
-import { REFERENCES_DIR } from "./save_reference.js";
 import {
   applyRewrites,
   buildIndex,

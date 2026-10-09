@@ -297,10 +297,16 @@ Order of operations (important — the checks short-circuit in this order):
      matter.stringify.
   8. The post-write hook (§7) runs: log.md entry, then git commit
      "save: <relativePath>".
+  9. Index check (§14): when the vault has a root index.md, the new note is
+     checked against it. index.md is never written.
 
 Output on write:
-  text: `Created: [<vaultName>] <relativePath>`
-  structuredContent: { path, vault }
+  text: `Created: [<vaultName>] <relativePath>`, followed — only when index.md
+        exists and does not reach the note — by a paragraph starting
+        "Not in index.md yet." that names the [[<basename>]] to add and says to
+        add it with update in the same pass.
+  structuredContent: { path, vault, indexed?, status, verified? }
+        `indexed` is present exactly when the vault has a root index.md.
 
 There is no content-based folder inference. A note goes to the vault root
 unless `folder` is given. An existing file at the target path is overwritten
@@ -344,9 +350,13 @@ Behaviour:
   4. Parent directories created recursively; content written UTF-8 as-is.
   5. Post-write hook (§7): log.md entry, then commit
      "save_reference: references/<path>".
+  6. Index check (§14), by path: references are outside the link graph.
 
-Output: text `Stored: [<vaultName>] <relativePath>`
-        structuredContent: { path, vault }
+Output: text `Stored: [<vaultName>] <relativePath>`, followed — only when
+        index.md exists and does not name the path — by a "Not in index.md yet."
+        paragraph giving the markdown link to add,
+        [<file name>](references/<path>), and saying a [[wikilink]] does not count.
+        structuredContent: { path, vault, indexed? }
 
 Top-level folder guard: `references/` is created on demand and
 assertKnownTopLevelFolder is NOT called. The guard exists to stop a
@@ -557,23 +567,31 @@ Input:  { vault?: string, classes?: Array<LinkClass> }
 Output: a summary line, then one section per class, grouped by vault:
 
     349 link(s) across 2 vault(s): ok=348 planned=1 external=0
-      renamed-candidate=0 broken=0 | failures=0
+      renamed-candidate=0 broken=0 | failures=0 | unindexed=1
 
     planned (1)
     [tech]
     - concepts/frontend/dom-document-object-model.md:114  [[mvc-flux-...]]
 
+    unindexed (1) — not reached from index.md
+    [work]
+    - mobile/qa-builds-for-the-new-rn-app.md
+
         structuredContent: {
           summary: { total, vaults: string[], ok, planned, external,
-                     "renamed-candidate", broken, failures, healthy,
-                     skipped: string[] },
+                     "renamed-candidate", broken, failures, unindexed,
+                     healthy, skipped: string[] },
           findings: [{ vault, file, line, raw, target, class,
                        resolved?, suggestion?, suggestionSource?,
-                       externalVault?, ambiguous? }]
+                       externalVault?, ambiguous? }],
+          unindexed: [{ vault, file }]
         }
 
-`failures` = broken + renamed-candidate. `healthy` = failures === 0. Every class
-key is always present, so a consumer can read a zero rather than a missing key.
+`failures` = broken + renamed-candidate. `unindexed` = files the vault's root
+index.md does not reach (§14); a vault without index.md contributes none.
+`healthy` = failures === 0 AND unindexed === 0. Every class key is always
+present, so a consumer can read a zero rather than a missing key. `unindexed` is
+not a link class: `classes` does not filter it, and it is always listed.
 
 `healthy` speaks ONLY for the vaults in `vaults`. `skipped` names configured
 vaults absent from this machine (§2), and the text summary appends
@@ -1002,7 +1020,8 @@ src/vaults.ts            VaultRegistry, loadVaultConfig, toRegistry,
 src/frontmatter.ts       status/verified/stale_when rules (§13) — pure, shared by
                          save and update so they cannot drift.
 src/paths.ts             normalizeVaultPath, resolveVaultPath, getAllMarkdownFiles,
-                         listTopLevelFolders, assertKnownTopLevelFolder.
+                         listTopLevelFolders, assertKnownTopLevelFolder,
+                         REFERENCES_DIR.
 src/text.ts              pure helpers (§8) — no filesystem access.
 src/hooks.ts             afterWrite — the single post-write hook (§7).
 src/git.ts               findRepoRoot, ensureRepo, commitVault, gitMove,
@@ -1017,6 +1036,9 @@ src/wikilinks.ts         scanWikilinks / renderWikilink / rewriteWikilinks (§12
 src/lint-candidates.ts   buildVaultIndex, resolveTarget, basenameSimilarity,
                          suggestTarget, classifyLink, summarize (§6.10, §12).
                          Pure: takes prebuilt indexes and a rename map.
+src/index-coverage.ts    INDEX_NOTE, indexCoverage, isIndexed, findUnindexed
+                         (pure) and readIndexCoverage, listIndexableFiles (fs)
+                         (§14). Used by save, save_reference and lint_links.
 src/refactor.ts          shared internals for the five refactor tools — loadNotes,
                          buildIndex, findBacklinks, preferredTarget,
                          normalizeMapping, planRewrites, applyRewrites,
@@ -1028,7 +1050,8 @@ src/sources.ts           sourceSchema (zod), sourceKey, mergeSources — shared 
                          save and update.
 src/tools/<name>.ts      one file per tool, each exporting
                          register<Name>(server, registry, vaultFolders?).
-                         save_reference also exports referencePath/REFERENCES_DIR;
+                         save_reference also exports referencePath and
+                         re-exports REFERENCES_DIR (defined in paths.ts);
                          move also exports checkMovable/resolveDestination/
                          titleDivergence; bulk_move also exports validateBatch.
 src/*.test.ts            vitest.
@@ -1271,3 +1294,36 @@ rather than a date, because that is how these notes actually expire. Nothing
 checks it; it is read by a human opening the note. `save` writes it when given;
 `update` replaces it when given, removes it when given as "", and leaves it alone
 when omitted — like every other frontmatter field it does not manage.
+
+
+14. INDEX NOTE (index.md coverage)
+----------------------------------
+A vault MAY keep a hand-curated map at its root, `index.md`, meant to reach every
+note. Its presence opts the vault into the coverage check; a vault without one is
+never checked and nothing below applies to it.
+
+The server NEVER writes index.md. Which section a note belongs in, and where it
+sits in a reading chain, is an editorial call the caller makes with update. The
+server's part is to notice a file the map does not reach:
+  - at write time: save (§6.1) and save_reference (§6.2) append a
+    "Not in index.md yet." paragraph to their text and set `indexed: false`;
+  - afterwards: lint_links (§6.10) lists the file as unindexed and the vault is
+    not healthy.
+Motivation: on 2026-10-08 agents saved eight notes into `work` and none reached
+its index. The rule lived only in prose (the index itself, the client skill),
+and nothing on the write path said anything.
+
+Which files must be reached ("indexable"): every markdown note in the vault,
+plus every non-dot file under references/ whatever its type. index.md and log.md
+themselves are exempt.
+
+What counts as reaching a file:
+  - a note: some wikilink in index.md resolves to it under §12 — every link shape
+    counts ([[x]], [[folder/x]], [[x|Label]], [[x#H]]), a link inside code does
+    not (same scanner), and a resolving `<!-- intentional -->` link counts once
+    the note exists.
+  - a reference: index.md's text contains its vault-relative path
+    (`references/...`), raw or URI-encoded — a markdown link or a path in
+    backticks. A [[wikilink]] does not count: references are outside the link
+    graph (§12, "Graph membership"), so it would not resolve.
+

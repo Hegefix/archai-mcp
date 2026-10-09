@@ -53,6 +53,14 @@ export {
   planRewrites,
   describeRewrites,
 } from "./refactor.js";
+export {
+  INDEX_NOTE,
+  indexCoverage,
+  isIndexed,
+  findUnindexed,
+  readIndexCoverage,
+  listIndexableFiles,
+} from "./index-coverage.js";
 export { createJournal } from "./rollback.js";
 export { checkMovable, resolveDestination, titleDivergence } from "./tools/move.js";
 export { validateBatch } from "./tools/bulk_move.js";

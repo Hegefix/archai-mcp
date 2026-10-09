@@ -11,6 +11,12 @@ import {
   type VaultIndex,
 } from "../lint-candidates.js";
 import { buildIndex, loadNotes } from "../refactor.js";
+import {
+  INDEX_NOTE,
+  findUnindexed,
+  listIndexableFiles,
+  readIndexCoverage,
+} from "../index-coverage.js";
 
 /** A `broken` or `renamed-candidate` link is a defect; the other classes are not. */
 function isFailure(finding: LinkFinding): boolean {
@@ -45,7 +51,10 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
         `never as a clean vault. Links ` +
         `inside fenced or inline code are not links. A dangling link on a line carrying ` +
         `"${PLANNED_MARKER}" is reported as planned, not a failure; a link whose note ` +
-        "lives in another vault is external, never broken. Read-only.",
+        "lives in another vault is external, never broken. Also lists every note a vault's " +
+        `root ${INDEX_NOTE} does not reach as unindexed (references count when the index ` +
+        "names their path); an unindexed file makes the vault unhealthy, and a vault without " +
+        `${INDEX_NOTE} is not checked. Read-only.`,
       inputSchema: {
         vault: z
           .string()
@@ -84,8 +93,17 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
       }
 
       const findings: LinkFinding[] = [];
+      const unindexed: Array<{ vault: string; file: string }> = [];
       for (const [name, vaultPath] of targets) {
         const index = indexes.get(name) as VaultIndex;
+
+        const coverage = await readIndexCoverage(vaultPath, index);
+        if (coverage !== null) {
+          for (const file of findUnindexed(await listIndexableFiles(vaultPath), coverage)) {
+            unindexed.push({ vault: name, file });
+          }
+        }
+
         const others = [...indexes.entries()]
           .filter(([other]) => other !== name)
           .map(([, i]) => i);
@@ -112,6 +130,7 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
         `${findings.length} link(s) across ${targets.length} vault(s): ` +
         LINK_CLASSES.map((c) => `${c}=${counts[c]}`).join(" ") +
         ` | failures=${failures}` +
+        ` | unindexed=${unindexed.length}` +
         (skipped.length === 0 ? "" : ` | skipped=${skipped.join(",")}`);
 
       const sections = LINK_CLASSES.filter((c) => shown.includes(c))
@@ -126,6 +145,21 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
         })
         .filter((s) => s !== "");
 
+      // Not a link class, so the `classes` filter doesn't apply: like a failure, an
+      // unindexed file is always listed.
+      if (unindexed.length > 0) {
+        const byVault = [...new Set(unindexed.map((u) => u.vault))].map((v) => {
+          const rows = unindexed
+            .filter((u) => u.vault === v)
+            .map((u) => `- ${u.file}`)
+            .join("\n");
+          return `[${v}]\n${rows}`;
+        });
+        sections.push(
+          `unindexed (${unindexed.length}) — not reached from ${INDEX_NOTE}\n${byVault.join("\n")}`
+        );
+      }
+
       const text =
         sections.length === 0 ? summaryLine : `${summaryLine}\n\n${sections.join("\n\n")}`;
 
@@ -137,12 +171,14 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
             vaults: targets.map(([name]) => name),
             ...counts,
             failures,
-            healthy: failures === 0,
+            unindexed: unindexed.length,
+            healthy: failures === 0 && unindexed.length === 0,
             // `healthy` speaks only for the vaults that were read; `skipped` is what
             // it does not cover.
             skipped,
           },
           findings: findings.filter((f) => shown.includes(f.class)),
+          unindexed,
         },
       };
     }

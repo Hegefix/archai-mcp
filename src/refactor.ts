@@ -7,12 +7,16 @@
  */
 
 import { readFile, writeFile } from "node:fs/promises";
-import { getAllMarkdownFiles, normalizeVaultPath, resolveVaultPath } from "./paths.js";
+import {
+  getAllMarkdownFiles,
+  normalizeVaultPath,
+  resolveVaultPath,
+  REFERENCES_DIR,
+} from "./paths.js";
 import { buildVaultIndex, resolveTarget, type VaultIndex } from "./lint-candidates.js";
 import { rewriteWikilinks, scanWikilinks, type Wikilink } from "./wikilinks.js";
 import type { Journal } from "./rollback.js";
 import { LOG_FILE } from "./log.js";
-import { REFERENCES_DIR } from "./tools/save_reference.js";
 
 /** Drop a trailing `.md`, case-insensitively. */
 export function stem(notePath: string): string {

@@ -3,6 +3,12 @@ import { readFile } from "node:fs/promises";
 import { readdir } from "node:fs/promises";
 import { glob } from "glob";
 
+/**
+ * Every reference lands under this fixed top-level folder. Lives here rather than
+ * in `tools/save_reference.ts` so core modules can name it without importing a tool.
+ */
+export const REFERENCES_DIR = "references";
+
 export function normalizeVaultPath(input: string): string {
   if (typeof input !== "string") {
     throw new Error("Path must be a string");

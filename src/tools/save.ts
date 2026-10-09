@@ -22,6 +22,8 @@ import {
 import { sourceSchema, mergeSources } from "../sources.js";
 import { afterWrite } from "../hooks.js";
 import { LOG_FILE } from "../log.js";
+import { buildIndex } from "../refactor.js";
+import { INDEX_NOTE, isIndexed, readIndexCoverage } from "../index-coverage.js";
 import {
   resolveStatusFields,
   STATUS_VALUES,
@@ -52,7 +54,8 @@ export function registerSave(
     "save",
     {
       description:
-        "Create a new note in an Obsidian vault. Searches for duplicates first — returns matches instead of creating if similar notes exist. Use force=true to skip duplicate check. Rejects titles containing Cyrillic characters.",
+        "Create a new note in an Obsidian vault. Searches for duplicates first — returns matches instead of creating if similar notes exist. Use force=true to skip duplicate check. Rejects titles containing Cyrillic characters. " +
+        "When the vault has a root index.md (its map), the result says whether the new note is linked from it (structured `indexed`); a note that is not must be added to index.md with update in the same pass.",
       inputSchema: {
         title: z.string().describe("Note title"),
         content: z.string().describe("Markdown content of the note"),
@@ -293,24 +296,45 @@ export function registerSave(
       await mkdir(dirname(fullPath), { recursive: true });
       await writeFile(fullPath, fileContent, "utf-8");
 
+      // Normalized so the log line, commit message and index check all see a posix
+      // path regardless of the platform `join` above ran on.
+      const notePath = normalizeVaultPath(relativePath);
+
       await afterWrite({
         tool: "save",
         vaultName,
         vaultPath,
-        // Normalized so the log line and commit message carry a posix path
-        // regardless of the platform `join` above ran on.
-        path: normalizeVaultPath(relativePath),
+        path: notePath,
         title,
         log: isLogEnabled(registry, vaultName),
       });
 
+      // The index is curated by hand, so the server only says when the new note is
+      // missing from it — while the caller still has the note in mind to place.
+      const coverage = await readIndexCoverage(
+        vaultPath,
+        await buildIndex(vaultName, vaultPath)
+      );
+      const indexed = coverage === null ? undefined : isIndexed(coverage, notePath);
+      const reminder =
+        indexed === false
+          ? `\n\nNot in ${INDEX_NOTE} yet. ${INDEX_NOTE} is this vault's map and every ` +
+            `note belongs in it: read it, add [[${toKebabCase(title)}]] with a one-line ` +
+            `description under the section it fits, and write that back with update — in ` +
+            `this same pass. Until then lint_links reports this note as unindexed.`
+          : "";
+
       return {
         content: [
-          { type: "text" as const, text: `Created: [${vaultName}] ${relativePath}` },
+          {
+            type: "text" as const,
+            text: `Created: [${vaultName}] ${relativePath}${reminder}`,
+          },
         ],
         structuredContent: {
           path: relativePath,
           vault: vaultName,
+          ...(indexed === undefined ? {} : { indexed }),
           status: resolvedStatus.status,
           ...(resolvedStatus.verified === undefined
             ? {}
