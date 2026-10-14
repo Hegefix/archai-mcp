@@ -1,13 +1,15 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v3";
 import matter from "gray-matter";
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, writeFile, access } from "node:fs/promises";
 import { normalizeVaultPath, resolveVaultPath } from "../paths.js";
 import { type VaultRegistry, resolveVault, isLogEnabled } from "../vaults.js";
 import { todayISO } from "../text.js";
 import { sourceSchema, mergeSources } from "../sources.js";
 import { afterWrite } from "../hooks.js";
 import { resolveStatusFields, STATUS_VALUES } from "../frontmatter.js";
+import { INDEX_NOTE, UP_FIELD, UP_LINK } from "../index-coverage.js";
+import { isExcluded } from "../refactor.js";
 
 export function registerUpdate(server: McpServer, registry: VaultRegistry): void {
   server.registerTool(
@@ -16,6 +18,8 @@ export function registerUpdate(server: McpServer, registry: VaultRegistry): void
       description:
         "Update the content of an existing note. Preserves frontmatter (including " +
         "stale_when and any hand-added fields) and bumps the updated date. " +
+        "In a vault with a root index.md, a note with no `up` property gains " +
+        "`up: '[[index]]'`; an existing `up` is never changed. " +
         "Any sources passed are merged into the note's existing provenance rather than replacing it.",
       inputSchema: {
         path: z
@@ -131,6 +135,21 @@ export function registerUpdate(server: McpServer, registry: VaultRegistry): void
       if (sources && sources.length > 0) {
         // Provenance accumulates over a note's life, so merge instead of clobber.
         parsed.data["sources"] = mergeSources(parsed.data["sources"], sources);
+      }
+      // A note written outside save (by hand, or before the up link existed) gains
+      // it on its next update. An `up` already present — even pointing elsewhere —
+      // is the author's and stays.
+      const relative = normalizeVaultPath(notePath);
+      if (
+        !(UP_FIELD in parsed.data) &&
+        relative !== INDEX_NOTE &&
+        !isExcluded(relative) &&
+        (await access(resolveVaultPath(vaultPath, INDEX_NOTE)).then(
+          () => true,
+          () => false
+        ))
+      ) {
+        parsed.data[UP_FIELD] = UP_LINK;
       }
       const updated = matter.stringify(
         newContent,

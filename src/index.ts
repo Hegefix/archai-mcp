@@ -55,6 +55,9 @@ export {
 } from "./refactor.js";
 export {
   INDEX_NOTE,
+  UP_FIELD,
+  UP_LINK,
+  linksUp,
   indexCoverage,
   isIndexed,
   findUnindexed,

@@ -23,7 +23,13 @@ import { sourceSchema, mergeSources } from "../sources.js";
 import { afterWrite } from "../hooks.js";
 import { LOG_FILE } from "../log.js";
 import { buildIndex } from "../refactor.js";
-import { INDEX_NOTE, isIndexed, readIndexCoverage } from "../index-coverage.js";
+import {
+  INDEX_NOTE,
+  UP_FIELD,
+  UP_LINK,
+  isIndexed,
+  readIndexCoverage,
+} from "../index-coverage.js";
 import {
   resolveStatusFields,
   STATUS_VALUES,
@@ -55,7 +61,7 @@ export function registerSave(
     {
       description:
         "Create a new note in an Obsidian vault. Searches for duplicates first — returns matches instead of creating if similar notes exist. Use force=true to skip duplicate check. Rejects titles containing Cyrillic characters. " +
-        "When the vault has a root index.md (its map), the result says whether the new note is linked from it (structured `indexed`); a note that is not must be added to index.md with update in the same pass.",
+        "When the vault has a root index.md (its map), the new note gets `up: '[[index]]'` in its frontmatter, and the result says whether index.md links to the note (structured `indexed`); a note that is not must be added to index.md with update in the same pass.",
       inputSchema: {
         title: z.string().describe("Note title"),
         content: z.string().describe("Markdown content of the note"),
@@ -289,6 +295,11 @@ export function registerSave(
       }
       if (sources && sources.length > 0) {
         frontmatter["sources"] = mergeSources([], sources);
+      }
+      // Every note in a vault with a map links back up to it. Unlike placing the
+      // note in the index, this needs no judgment, so the server writes it.
+      if (await exists(resolveVaultPath(vaultPath, INDEX_NOTE))) {
+        frontmatter[UP_FIELD] = UP_LINK;
       }
 
       const fileContent = matter.stringify(content, frontmatter);

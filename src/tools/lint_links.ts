@@ -1,5 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod/v3";
+import matter from "gray-matter";
 import { type VaultRegistry, resolveVault } from "../vaults.js";
 import { listRenamedBasenames } from "../git.js";
 import {
@@ -13,7 +14,9 @@ import {
 import { buildIndex, loadNotes } from "../refactor.js";
 import {
   INDEX_NOTE,
+  UP_LINK,
   findUnindexed,
+  linksUp,
   listIndexableFiles,
   readIndexCoverage,
 } from "../index-coverage.js";
@@ -53,8 +56,9 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
         `"${PLANNED_MARKER}" is reported as planned, not a failure; a link whose note ` +
         "lives in another vault is external, never broken. Also lists every note a vault's " +
         `root ${INDEX_NOTE} does not reach as unindexed (references count when the index ` +
-        "names their path); an unindexed file makes the vault unhealthy, and a vault without " +
-        `${INDEX_NOTE} is not checked. Read-only.`,
+        "names their path), and every note whose frontmatter lacks " +
+        `"up: '${UP_LINK}'" as missing-up. Either makes the vault unhealthy; a vault without ` +
+        `${INDEX_NOTE} is checked for neither. Read-only.`,
       inputSchema: {
         vault: z
           .string()
@@ -94,6 +98,7 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
 
       const findings: LinkFinding[] = [];
       const unindexed: Array<{ vault: string; file: string }> = [];
+      const missingUp: Array<{ vault: string; file: string }> = [];
       for (const [name, vaultPath] of targets) {
         const index = indexes.get(name) as VaultIndex;
 
@@ -104,12 +109,24 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
           }
         }
 
+        const notes = await loadNotes(vaultPath);
+        if (coverage !== null) {
+          // loadNotes already leaves out log.md and references/, which carry no
+          // frontmatter by design; the map itself has nowhere to link up to.
+          for (const note of notes) {
+            if (note.file === INDEX_NOTE) continue;
+            if (!linksUp(matter(note.content).data, index)) {
+              missingUp.push({ vault: name, file: note.file });
+            }
+          }
+        }
+
         const others = [...indexes.entries()]
           .filter(([other]) => other !== name)
           .map(([, i]) => i);
         const renames = await listRenamedBasenames(vaultPath);
 
-        for (const note of await loadNotes(vaultPath)) {
+        for (const note of notes) {
           for (const link of note.links) {
             findings.push(classifyLink(link, note.file, { index, others, renames }));
           }
@@ -131,6 +148,7 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
         LINK_CLASSES.map((c) => `${c}=${counts[c]}`).join(" ") +
         ` | failures=${failures}` +
         ` | unindexed=${unindexed.length}` +
+        ` | missing-up=${missingUp.length}` +
         (skipped.length === 0 ? "" : ` | skipped=${skipped.join(",")}`);
 
       const sections = LINK_CLASSES.filter((c) => shown.includes(c))
@@ -159,6 +177,18 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
           `unindexed (${unindexed.length}) — not reached from ${INDEX_NOTE}\n${byVault.join("\n")}`
         );
       }
+      if (missingUp.length > 0) {
+        const byVault = [...new Set(missingUp.map((u) => u.vault))].map((v) => {
+          const rows = missingUp
+            .filter((u) => u.vault === v)
+            .map((u) => `- ${u.file}`)
+            .join("\n");
+          return `[${v}]\n${rows}`;
+        });
+        sections.push(
+          `missing-up (${missingUp.length}) — no "up: '${UP_LINK}'" in frontmatter\n${byVault.join("\n")}`
+        );
+      }
 
       const text =
         sections.length === 0 ? summaryLine : `${summaryLine}\n\n${sections.join("\n\n")}`;
@@ -172,13 +202,15 @@ export function registerLintLinks(server: McpServer, registry: VaultRegistry): v
             ...counts,
             failures,
             unindexed: unindexed.length,
-            healthy: failures === 0 && unindexed.length === 0,
+            missingUp: missingUp.length,
+            healthy: failures === 0 && unindexed.length === 0 && missingUp.length === 0,
             // `healthy` speaks only for the vaults that were read; `skipped` is what
             // it does not cover.
             skipped,
           },
           findings: findings.filter((f) => shown.includes(f.class)),
           unindexed,
+          missingUp,
         },
       };
     }

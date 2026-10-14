@@ -1,12 +1,22 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile, readFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer, buildVaultIndex, indexCoverage, isIndexed, findUnindexed } from "./index.js";
+import matter from "gray-matter";
+import {
+  createServer,
+  buildVaultIndex,
+  indexCoverage,
+  isIndexed,
+  findUnindexed,
+  linksUp,
+  UP_FIELD,
+  UP_LINK,
+} from "./index.js";
 
 const run = promisify(execFile);
 
@@ -91,6 +101,29 @@ describe("index coverage", () => {
   });
 });
 
+describe("linksUp", () => {
+  const index = buildVaultIndex("v", ["index.md", "notes/other.md", "notes/sub/index-of-x.md"]);
+
+  it("accepts a link to the root index note, in any link shape", () => {
+    expect(linksUp({ up: "[[index]]" }, index)).toBe(true);
+    expect(linksUp({ up: "[[index|Map]]" }, index)).toBe(true);
+    expect(linksUp({ up: ["[[other]]", "[[index]]"] }, index)).toBe(true);
+  });
+
+  it("rejects a missing, foreign or unquoted value", () => {
+    expect(linksUp({}, index)).toBe(false);
+    expect(linksUp({ up: "[[other]]" }, index)).toBe(false);
+    expect(linksUp({ up: "index" }, index)).toBe(false);
+    // `up: [[index]]` without quotes is YAML for a nested list, not a link.
+    expect(linksUp({ up: [["index"]] }, index)).toBe(false);
+  });
+
+  it("writes the value save puts in frontmatter", () => {
+    expect(UP_FIELD).toBe("up");
+    expect(linksUp({ [UP_FIELD]: UP_LINK }, index)).toBe(true);
+  });
+});
+
 // --- Integration via the MCP client ---
 
 describe("index coverage in tools", () => {
@@ -116,7 +149,7 @@ describe("index coverage in tools", () => {
     await git(vaultPath, ["config", "user.name", "archai test"]);
     await writeFile(
       join(vaultPath, "notes/listed.md"),
-      "---\ntitle: Listed\n---\nalready on the map\n",
+      "---\ntitle: Listed\nup: '[[index]]'\n---\nalready on the map\n",
       "utf-8"
     );
     await writeFile(join(vaultPath, "index.md"), "# Map\n- [[listed]]\n", "utf-8");
@@ -158,6 +191,59 @@ describe("index coverage in tools", () => {
       });
       expect(getText(result)).not.toContain("index.md");
       expect(structured(result)["indexed"]).toBe(true);
+    });
+
+    it("links the new note up to index.md in frontmatter", async () => {
+      await start();
+      await call("save", { title: "Fresh Note", content: "body", folder: "notes", force: true });
+      const raw = await readFile(join(vaultPath, "notes/fresh-note.md"), "utf-8");
+      expect(raw).toContain("up: '[[index]]'");
+      expect(matter(raw).data["up"]).toBe("[[index]]");
+      expect(matter(raw).content.trim()).toBe("body");
+    });
+
+    it("keeps the up link through an update", async () => {
+      await start();
+      await call("save", { title: "Fresh Note", content: "body", folder: "notes", force: true });
+      await call("update", { path: "notes/fresh-note.md", content: "new body" });
+      const raw = await readFile(join(vaultPath, "notes/fresh-note.md"), "utf-8");
+      expect(matter(raw).data["up"]).toBe("[[index]]");
+    });
+
+    it("gives a note written outside save its up link on the next update", async () => {
+      await start();
+      await writeFile(join(vaultPath, "notes/legacy.md"), "---\ntitle: Legacy\n---\nold\n", "utf-8");
+      await call("update", { path: "notes/legacy.md", content: "edited" });
+      const raw = await readFile(join(vaultPath, "notes/legacy.md"), "utf-8");
+      expect(matter(raw).data["up"]).toBe("[[index]]");
+      expect(matter(raw).content.trim()).toBe("edited");
+    });
+
+    it("never overwrites an up the note already sets", async () => {
+      await writeFile(
+        join(vaultPath, "notes/child.md"),
+        "---\ntitle: Child\nup: '[[listed]]'\n---\nx\n",
+        "utf-8"
+      );
+      await start();
+      await call("update", { path: "notes/child.md", content: "y" });
+      const raw = await readFile(join(vaultPath, "notes/child.md"), "utf-8");
+      expect(matter(raw).data["up"]).toBe("[[listed]]");
+    });
+
+    it("never adds an up link to index.md itself on update", async () => {
+      await start();
+      await call("update", { path: "index.md", content: "# Map\n- [[listed]]\n" });
+      const raw = await readFile(join(vaultPath, "index.md"), "utf-8");
+      expect(matter(raw).data).not.toHaveProperty("up");
+    });
+
+    it("adds no up link in a vault without index.md", async () => {
+      await rm(join(vaultPath, "index.md"));
+      await start();
+      await call("save", { title: "Fresh Note", content: "body", folder: "notes", force: true });
+      const raw = await readFile(join(vaultPath, "notes/fresh-note.md"), "utf-8");
+      expect(matter(raw).data).not.toHaveProperty("up");
     });
 
     it("stays quiet in a vault without index.md", async () => {
@@ -211,17 +297,50 @@ describe("index coverage in tools", () => {
       expect(data["unindexed"]).toEqual([{ vault: "default", file: "references/raw/dump.yaml" }]);
     });
 
-    it("is healthy once index.md reaches every note", async () => {
+    it("is healthy once index.md reaches every note and every note links up", async () => {
       await start();
       const summary = structured(await call("lint_links", {}))["summary"];
-      expect(summary).toMatchObject({ unindexed: 0, healthy: true });
+      expect(summary).toMatchObject({ unindexed: 0, missingUp: 0, healthy: true });
     });
 
-    it("skips the check in a vault without index.md", async () => {
-      await rm(join(vaultPath, "index.md"));
+    it("reports a note with no up link to index.md and marks the vault unhealthy", async () => {
+      await writeFile(
+        join(vaultPath, "notes/orphan.md"),
+        "---\ntitle: Orphan\n---\nlisted, but no way back up\n",
+        "utf-8"
+      );
+      await writeFile(
+        join(vaultPath, "index.md"),
+        "# Map\n- [[listed]]\n- [[orphan]]\n",
+        "utf-8"
+      );
+      await start();
+      const result = await call("lint_links", {});
+      const data = structured(result);
+      expect(data["summary"]).toMatchObject({ unindexed: 0, missingUp: 1, healthy: false });
+      expect(data["missingUp"]).toEqual([{ vault: "default", file: "notes/orphan.md" }]);
+      expect(getText(result)).toContain("missing-up (1)");
+    });
+
+    it("never asks index.md or a reference to link up", async () => {
+      await mkdir(join(vaultPath, "references"), { recursive: true });
+      await writeFile(join(vaultPath, "references/raw.md"), "RAW\n", "utf-8");
+      await writeFile(
+        join(vaultPath, "index.md"),
+        "# Map\n- [[listed]]\n- [raw](references/raw.md)\n",
+        "utf-8"
+      );
       await start();
       const summary = structured(await call("lint_links", {}))["summary"];
-      expect(summary).toMatchObject({ unindexed: 0, healthy: true });
+      expect(summary).toMatchObject({ missingUp: 0, healthy: true });
+    });
+
+    it("skips both checks in a vault without index.md", async () => {
+      await rm(join(vaultPath, "index.md"));
+      await writeFile(join(vaultPath, "notes/stray.md"), "---\ntitle: Stray\n---\nx\n", "utf-8");
+      await start();
+      const summary = structured(await call("lint_links", {}))["summary"];
+      expect(summary).toMatchObject({ unindexed: 0, missingUp: 0, healthy: true });
     });
   });
 });

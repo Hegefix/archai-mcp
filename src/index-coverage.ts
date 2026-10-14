@@ -1,6 +1,6 @@
 /**
  * Coverage of a vault's root `index.md` — the hand-curated map meant to reach
- * every note in the vault.
+ * every note in the vault — and the link back up from each note to it.
  *
  * The server never writes the index: which section a note belongs in, and where
  * it sits in a reading chain, is an editorial call. What the server can do is
@@ -9,7 +9,12 @@
  * as `unindexed`). On 2026-10-08 agents saved eight notes into `work` and none of
  * them reached the index, because the rule lived only in prose nobody re-read.
  *
- * A vault without a root `index.md` has no map, and the check does not apply.
+ * The other direction is mechanical, so the server does write it: `save` puts
+ * `up: '[[index]]'` in every new note's frontmatter, and `lint_links` reports a
+ * note without one as `missing-up`. Obsidian tracks links in properties, so the
+ * note links back to its map without the body carrying any boilerplate.
+ *
+ * A vault without a root `index.md` has no map, and neither check applies.
  */
 
 import { glob } from "glob";
@@ -21,6 +26,12 @@ import { stem } from "./refactor.js";
 
 /** The vault map, at the vault root. */
 export const INDEX_NOTE = "index.md";
+
+/** Frontmatter property through which every note links back up to the map. */
+export const UP_FIELD = "up";
+
+/** The value `save` writes into `UP_FIELD`. */
+export const UP_LINK = `[[${stem(INDEX_NOTE)}]]`;
 
 export type IndexCoverage = {
   /** Notes (vault-relative, `.md` stripped) that a wikilink in index.md resolves to. */
@@ -59,6 +70,23 @@ export function findUnindexed(files: string[], coverage: IndexCoverage): string[
   return files
     .filter((f) => f !== INDEX_NOTE && f !== LOG_FILE && !isIndexed(coverage, f))
     .sort();
+}
+
+/**
+ * Whether a note's frontmatter links up to the vault's index note: `up` is a
+ * string, or a list of strings, holding a wikilink that resolves to index.md.
+ * An unquoted `up: [[index]]` is YAML for a nested list, which Obsidian does not
+ * read as a link either, so it does not count.
+ */
+export function linksUp(frontmatter: Record<string, unknown>, index: VaultIndex): boolean {
+  const value = frontmatter[UP_FIELD];
+  const values = Array.isArray(value) ? value : [value];
+  const target = stem(INDEX_NOTE);
+  return values.some(
+    (v) =>
+      typeof v === "string" &&
+      scanWikilinks(v).some((link) => resolveTarget(index, link.target) === target)
+  );
 }
 
 /** Read the vault's index.md and compute its coverage; null when there is none. */

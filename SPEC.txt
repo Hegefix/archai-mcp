@@ -293,6 +293,8 @@ Order of operations (important — the checks short-circuit in this order):
                                 normalized — undefined/empty fields dropped,
                                 key order resource,id,title,author,last_modified
                                 — and deduped within the batch on resource+id)
+         up:      '[[index]]'  (only when the vault has a root index.md; §14.
+                                Always last.)
   7. Parent directories are created recursively; the file is written UTF-8 via
      matter.stringify.
   8. The post-write hook (§7) runs: log.md entry, then git commit
@@ -409,7 +411,7 @@ Behaviour:
   - The file must already exist; missing -> isError "Error: file not found at <path>".
   - Existing frontmatter is parsed and reused as-is; `updated` is set to today's
     date (YYYY-MM-DD, UTC) and `status`/`verified` are resolved per §13. No other
-    field is added or removed — every hand-added field, `stale_when` included,
+    field is added or removed (except `sources` and `up`, below) — every hand-added field, `stale_when` included,
     survives untouched. A note with no frontmatter gains a block containing
     `updated` and `status`.
   - `sources` is the one exception to "reused as-is", and only when the caller
@@ -423,6 +425,9 @@ Behaviour:
     duplicating the entry. Omitting `sources` leaves the stored list untouched.
     An existing `sources` value that isn't usable source data is dropped rather
     than throwing; a single object (not a list) is treated as a one-entry list.
+  - `up` is the other exception (§14): in a vault with a root index.md, a note
+    with no `up` key gains `up: '[[index]]'`. An existing `up` is never changed,
+    and index.md, log.md and references/ never gain one.
   - The file is rewritten in full via matter.stringify.
   - Post-write hook (§7): log.md entry when enabled, then commit
     "update: <path>", staging only that path.
@@ -567,7 +572,7 @@ Input:  { vault?: string, classes?: Array<LinkClass> }
 Output: a summary line, then one section per class, grouped by vault:
 
     349 link(s) across 2 vault(s): ok=348 planned=1 external=0
-      renamed-candidate=0 broken=0 | failures=0 | unindexed=1
+      renamed-candidate=0 broken=0 | failures=0 | unindexed=1 | missing-up=0
 
     planned (1)
     [tech]
@@ -580,18 +585,21 @@ Output: a summary line, then one section per class, grouped by vault:
         structuredContent: {
           summary: { total, vaults: string[], ok, planned, external,
                      "renamed-candidate", broken, failures, unindexed,
-                     healthy, skipped: string[] },
+                     missingUp, healthy, skipped: string[] },
           findings: [{ vault, file, line, raw, target, class,
                        resolved?, suggestion?, suggestionSource?,
                        externalVault?, ambiguous? }],
-          unindexed: [{ vault, file }]
+          unindexed: [{ vault, file }],
+          missingUp: [{ vault, file }]
         }
 
 `failures` = broken + renamed-candidate. `unindexed` = files the vault's root
-index.md does not reach (§14); a vault without index.md contributes none.
-`healthy` = failures === 0 AND unindexed === 0. Every class key is always
-present, so a consumer can read a zero rather than a missing key. `unindexed` is
-not a link class: `classes` does not filter it, and it is always listed.
+index.md does not reach; `missingUp` = notes whose frontmatter has no `up` link
+to it (both §14); a vault without index.md contributes to neither.
+`healthy` = failures === 0 AND unindexed === 0 AND missingUp === 0. Every class
+key is always present, so a consumer can read a zero rather than a missing key.
+`unindexed` and `missing-up` are not link classes: `classes` does not filter
+them, and they are always listed.
 
 `healthy` speaks ONLY for the vaults in `vaults`. `skipped` names configured
 vaults absent from this machine (§2), and the text summary appends
@@ -1296,8 +1304,8 @@ checks it; it is read by a human opening the note. `save` writes it when given;
 when omitted — like every other frontmatter field it does not manage.
 
 
-14. INDEX NOTE (index.md coverage)
-----------------------------------
+14. INDEX NOTE (index.md coverage and the up link)
+--------------------------------------------------
 A vault MAY keep a hand-curated map at its root, `index.md`, meant to reach every
 note. Its presence opts the vault into the coverage check; a vault without one is
 never checked and nothing below applies to it.
@@ -1326,4 +1334,31 @@ What counts as reaching a file:
     (`references/...`), raw or URI-encoded — a markdown link or a path in
     backticks. A [[wikilink]] does not count: references are outside the link
     graph (§12, "Graph membership"), so it would not resolve.
+
+The other direction — each note linking UP to the map — needs no judgment, so
+the server does write it, as a frontmatter property rather than body text:
+
+    up: '[[index]]'
+
+  - save (§6.1) adds it, last, to every new note in a vault with a root
+    index.md.
+  - update (§6.4) preserves an existing `up` untouched, whatever it points at,
+    and adds `up: '[[index]]'` to a note that has no `up` key at all (never to
+    index.md, log.md or references/). That is the repair path for missing-up: a
+    note created by hand gains the link on its next update.
+  - lint_links (§6.10) lists a note without it as missing-up and the vault is
+    not healthy.
+  - It counts when `up` is a string, or a list of strings, holding a wikilink
+    that resolves to the root index.md (any link shape). An unquoted
+    `up: [[index]]` is YAML for a nested list — Obsidian does not read it as a
+    link either — so it does not count.
+  - Required of every markdown note except index.md itself, log.md and files
+    under references/ (no frontmatter by design).
+  - Obsidian tracks links in properties, so the note shows index in its links
+    and graph without boilerplate in the body. The link scanner (§12) skips
+    frontmatter, so `up` is not part of the graph the refactor tools rewrite;
+    index.md does not move, so nothing needs rewriting.
+Motivation: on 2026-10-14 notes were still visibly unlinked from the index when
+opened — 193 of them carried no link back up. The existing notes were
+backfilled once.
 
